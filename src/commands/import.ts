@@ -1,7 +1,7 @@
-import { readdirSync, statSync, existsSync } from 'fs';
+import { readdirSync, statSync, existsSync, writeFileSync, readFileSync, unlinkSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join, relative } from 'path';
-import { cpus, totalmem } from 'os';
+import { cpus, totalmem, homedir } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
 import { PostgresEngine } from '../core/postgres-engine.ts';
 import { importFile } from '../core/import-file.ts';
@@ -21,17 +21,36 @@ function defaultWorkers(): number {
 export async function runImport(engine: BrainEngine, args: string[]) {
   const dir = args.find(a => !a.startsWith('--'));
   const noEmbed = args.includes('--no-embed');
+  const fresh = args.includes('--fresh');
   const workersArg = args.find((a, i) => args[i - 1] === '--workers');
   const workerCount = workersArg ? parseInt(workersArg, 10) : 1;
 
   if (!dir) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh]');
     process.exit(1);
   }
 
   // Collect all .md files
-  const files = collectMarkdownFiles(dir);
-  console.log(`Found ${files.length} markdown files`);
+  const allFiles = collectMarkdownFiles(dir);
+  console.log(`Found ${allFiles.length} markdown files`);
+
+  // Resume from checkpoint if available
+  const checkpointPath = join(homedir(), '.gbrain', 'import-checkpoint.json');
+  let files = allFiles;
+  let resumeIndex = 0;
+
+  if (!fresh && existsSync(checkpointPath)) {
+    try {
+      const cp = JSON.parse(readFileSync(checkpointPath, 'utf-8'));
+      if (cp.dir === dir && cp.totalFiles === allFiles.length) {
+        resumeIndex = cp.processedIndex;
+        files = allFiles.slice(resumeIndex);
+        console.log(`Resuming from checkpoint: skipping ${resumeIndex} already-processed files`);
+      }
+    } catch {
+      // Invalid checkpoint, start fresh
+    }
+  }
 
   // Determine actual worker count
   const actualWorkers = workerCount > 1 ? workerCount : 1;
@@ -83,7 +102,20 @@ export async function runImport(engine: BrainEngine, args: string[]) {
       skipped++;
     }
     processed++;
-    if (processed % 100 === 0 || processed === files.length) logProgress();
+    if (processed % 100 === 0 || processed === files.length) {
+      logProgress();
+      // Save checkpoint every 100 files
+      if (processed % 100 === 0) {
+        try {
+          const cpDir = join(homedir(), '.gbrain');
+          if (!existsSync(cpDir)) { const { mkdirSync } = await import('fs'); mkdirSync(cpDir, { recursive: true }); }
+          writeFileSync(checkpointPath, JSON.stringify({
+            dir, totalFiles: allFiles.length, processedIndex: resumeIndex + processed,
+            timestamp: new Date().toISOString(),
+          }));
+        } catch { /* non-fatal */ }
+      }
+    }
   }
 
   if (actualWorkers > 1) {
@@ -118,6 +150,11 @@ export async function runImport(engine: BrainEngine, args: string[]) {
     if (count > 5) {
       console.error(`  ${count} files failed: ${err.slice(0, 100)}`);
     }
+  }
+
+  // Clear checkpoint on successful completion
+  if (existsSync(checkpointPath)) {
+    try { unlinkSync(checkpointPath); } catch { /* non-fatal */ }
   }
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
