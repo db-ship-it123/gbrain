@@ -279,7 +279,7 @@ Keyword search alone misses conceptual matches. "Ignore conventional wisdom" won
 
 ## Database schema
 
-9 tables in Postgres + pgvector:
+10 tables in Postgres + pgvector:
 
 ```
 pages                    The core content table
@@ -499,18 +499,23 @@ Initial embedding cost: ~$4-5 for 7,500 pages via OpenAI text-embedding-3-large.
 
 ## Docs
 
+- [GBRAIN_RECOMMENDED_SCHEMA.md](docs/GBRAIN_RECOMMENDED_SCHEMA.md) -- The recommended brain schema: MECE directories, compiled truth + timeline, enrichment pipelines, resolver decision tree
 - [GBRAIN_V0.md](docs/GBRAIN_V0.md) -- Full product spec, all architecture decisions, every option considered
 - [ENGINES.md](docs/ENGINES.md) -- Pluggable engine interface, capability matrix, how to add backends
 - [SQLITE_ENGINE.md](docs/SQLITE_ENGINE.md) -- Complete SQLite engine plan with schema, FTS5, vector search options
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Welcome PRs for:
+See [CONTRIBUTING.md](CONTRIBUTING.md). Run `bun test` for unit tests. For E2E tests
+against real Postgres+pgvector: `docker compose -f docker-compose.test.yml up -d` then
+`DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test bun run test:e2e`.
+
+Welcome PRs for:
 
 - SQLite engine implementation
-- Docker Compose for self-hosted Postgres
-- Additional migration sources
+- Additional migration sources (Logseq, Roam, Notion)
 - New enrichment API integrations
+- Performance optimizations
 
 ## License
 

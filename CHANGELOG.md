@@ -20,6 +20,14 @@ All notable changes to GBrain will be documented in this file.
 - Post-upgrade version verification in `gbrain upgrade`.
 - Parity test (`test/parity.test.ts`) verifies structural contract between operations, CLI, and MCP.
 - New `setup` skill replacing `install`: auto-provision Supabase via CLI, AGENTS.md injection, target TTHW < 2 min.
+- E2E test suite against real Postgres+pgvector. 13 realistic fixtures (miniature brain with people, companies, deals, meetings, concepts), 14 test suites covering all operations, search quality benchmarks, idempotency stress tests, schema validation, and full setup journey verification.
+- GitHub Actions E2E workflow: Tier 1 (mechanical) on every PR, Tier 2 (LLM skills via OpenClaw) nightly.
+- `docker-compose.test.yml` and `.env.testing.example` for local E2E development.
+
+### Fixed
+
+- Schema loader in `db.ts` broke on PL/pgSQL trigger functions containing semicolons inside `$$` blocks. Replaced per-statement execution with single `conn.unsafe()` call.
+- `traverseGraph` query failed with "could not identify equality operator for type json" when using `SELECT DISTINCT` with `json_agg`. Changed to `jsonb_agg`.
 
 ### Changed
 

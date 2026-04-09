@@ -29,18 +29,27 @@ Run `gbrain --help` or `gbrain --tools-json` for full command reference.
 
 ## Testing
 
-`bun test` runs all tests (4 test files). Tests: `test/markdown.test.ts`
-(frontmatter parsing, round-trip serialization), `test/chunkers/recursive.test.ts`
-(delimiter splitting, overlap, chunk sizing), `test/sync.test.ts` (manifest parsing,
-isSyncable filtering, pathToSlug conversion), `test/parity.test.ts` (operations
-contract parity between CLI, MCP, and tools-json).
+`bun test` runs all tests (9 unit test files + 3 E2E test files). Unit tests run
+without a database. E2E tests skip gracefully when `DATABASE_URL` is not set.
+
+Unit tests: `test/markdown.test.ts` (frontmatter parsing), `test/chunkers/recursive.test.ts`
+(chunking), `test/sync.test.ts` (sync logic), `test/parity.test.ts` (operations contract
+parity), `test/cli.test.ts` (CLI structure), `test/config.test.ts` (config redaction),
+`test/files.test.ts` (MIME/hash), `test/import-file.test.ts` (import pipeline),
+`test/upgrade.test.ts` (schema migrations).
+
+E2E tests (`test/e2e/`): Run against real Postgres+pgvector. Require `DATABASE_URL`.
+- `bun run test:e2e` runs Tier 1 (mechanical, all operations, no API keys)
+- Tier 2 (`skills.test.ts`) requires OpenClaw + API keys, runs nightly in CI
+- Local setup: `docker compose -f docker-compose.test.yml up -d` then
+  `DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test bun run test:e2e`
 
 ## Skills
 
 Read the skill files in `skills/` before doing brain operations. They contain the
 workflows, heuristics, and quality rules for ingestion, querying, maintenance,
-enrichment, and setup. 7 skills: ingest, query, maintain, enrich, briefing,
-migrate, setup.
+enrichment, and setup. 8 skills: ingest, query, maintain, enrich, briefing,
+migrate, setup, install.
 
 ## Build
 
