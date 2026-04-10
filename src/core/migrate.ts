@@ -1,4 +1,5 @@
 import type { BrainEngine } from './engine.ts';
+import { slugifyPath } from './sync.ts';
 
 /**
  * Schema migrations — run automatically on initSchema().
@@ -8,20 +9,45 @@ import type { BrainEngine } from './engine.ts';
  *
  * Each migration runs in a transaction: if the SQL fails, the version stays
  * where it was and the next run retries cleanly.
+ *
+ * Migrations can also include a handler function for application-level logic
+ * (e.g., data transformations that need TypeScript, not just SQL).
  */
 
 interface Migration {
   version: number;
   name: string;
   sql: string;
+  handler?: (engine: BrainEngine) => Promise<void>;
 }
 
 // Migrations are embedded here, not loaded from files.
 // Add new migrations at the end. Never modify existing ones.
 const MIGRATIONS: Migration[] = [
   // Version 1 is the baseline (schema.sql creates everything with IF NOT EXISTS).
-  // Future migrations go here:
-  // { version: 2, name: 'add_aliases', sql: `ALTER TABLE pages ADD COLUMN IF NOT EXISTS aliases TEXT[];` },
+  {
+    version: 2,
+    name: 'slugify_existing_pages',
+    sql: '',
+    handler: async (engine) => {
+      const pages = await engine.listPages();
+      let renamed = 0;
+      for (const page of pages) {
+        const newSlug = slugifyPath(page.slug);
+        if (newSlug !== page.slug) {
+          try {
+            await engine.updateSlug(page.slug, newSlug);
+            await engine.rewriteLinks(page.slug, newSlug);
+            renamed++;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error(`  Warning: could not rename "${page.slug}" → "${newSlug}": ${msg}`);
+          }
+        }
+      }
+      if (renamed > 0) console.log(`  Renamed ${renamed} slugs`);
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
@@ -35,17 +61,24 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
   let applied = 0;
   for (const m of MIGRATIONS) {
     if (m.version > current) {
-      // Each migration is transactional
-      await engine.transaction(async (tx) => {
-        // Execute the migration SQL via raw connection
-        // We need to access the underlying sql connection
-        const eng = tx as any;
-        const sql = eng.sql || eng._sql;
-        if (sql) {
-          await sql.unsafe(m.sql);
-          await sql`UPDATE config SET value = ${String(m.version)} WHERE key = 'version'`;
-        }
-      });
+      // SQL migration (transactional)
+      if (m.sql) {
+        await engine.transaction(async (tx) => {
+          const eng = tx as any;
+          const sql = eng.sql || eng._sql;
+          if (sql) {
+            await sql.unsafe(m.sql);
+          }
+        });
+      }
+
+      // Application-level handler (runs outside transaction for flexibility)
+      if (m.handler) {
+        await m.handler(engine);
+      }
+
+      // Update version after both SQL and handler succeed
+      await engine.setConfig('version', String(m.version));
       console.log(`  Migration ${m.version} applied: ${m.name}`);
       applied++;
     }
