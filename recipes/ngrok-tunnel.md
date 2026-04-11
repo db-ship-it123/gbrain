@@ -3,7 +3,7 @@ id: ngrok-tunnel
 name: Public Tunnel
 version: 0.7.0
 description: Fixed public URL for your brain (MCP server, voice agent, any service). One ngrok account, never changes.
-category: sense
+category: infra
 requires: []
 secrets:
   - name: NGROK_AUTHTOKEN

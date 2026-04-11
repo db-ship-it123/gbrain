@@ -3,7 +3,7 @@ id: credential-gateway
 name: Credential Gateway
 version: 0.7.0
 description: Secure access to Gmail, Google Calendar, and other Google services. ClawVisor (recommended) or direct Google OAuth.
-category: sense
+category: infra
 requires: []
 secrets:
   - name: CLAWVISOR_URL

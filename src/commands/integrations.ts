@@ -38,7 +38,7 @@ interface RecipeFrontmatter {
   name: string;
   version: string;
   description: string;
-  category: 'sense' | 'reflex';
+  category: 'infra' | 'sense' | 'reflex';
   requires: string[];
   secrets: RecipeSecret[];
   health_checks: string[];
@@ -290,6 +290,7 @@ function cmdList(args: string[]): void {
     return;
   }
 
+  const infra = recipes.filter(r => r.frontmatter.category === 'infra');
   const senses = recipes.filter(r => r.frontmatter.category === 'sense');
   const reflexes = recipes.filter(r => r.frontmatter.category === 'reflex');
 
@@ -302,38 +303,34 @@ function cmdList(args: string[]): void {
       category: r.frontmatter.category,
       status: getStatus(r),
       setup_time: r.frontmatter.setup_time,
+      requires: r.frontmatter.requires,
     });
     console.log(JSON.stringify({
+      infra: infra.map(toJson),
       senses: senses.map(toJson),
       reflexes: reflexes.map(toJson),
     }, null, 2));
     return;
   }
 
-  // Dashboard view
-  if (senses.length > 0) {
-    console.log('\n  SENSES (data inputs)                          STATUS');
-    console.log('  ' + '-'.repeat(55));
-    for (const r of senses) {
+  const printSection = (title: string, items: ParsedRecipe[]) => {
+    if (items.length === 0) return;
+    console.log(`\n  ${title}`);
+    console.log('  ' + '-'.repeat(62));
+    for (const r of items) {
       const status = getStatus(r);
       const statusStr = status === 'active' ? 'ACTIVE' : status === 'configured' ? 'CONFIGURED' : 'AVAILABLE';
-      const id = r.frontmatter.id.padEnd(18);
-      const desc = r.frontmatter.description.slice(0, 30).padEnd(30);
-      console.log(`  ${id}${desc}${statusStr}`);
+      const id = r.frontmatter.id.padEnd(22);
+      const desc = r.frontmatter.description.slice(0, 28).padEnd(28);
+      const deps = r.frontmatter.requires.length > 0 ? ` (needs ${r.frontmatter.requires.join(', ')})` : '';
+      console.log(`  ${id}${desc}  ${statusStr}${deps}`);
     }
-  }
+  };
 
-  if (reflexes.length > 0) {
-    console.log('\n  REFLEXES (automated responses)                STATUS');
-    console.log('  ' + '-'.repeat(55));
-    for (const r of reflexes) {
-      const status = getStatus(r);
-      const statusStr = status === 'active' ? 'ACTIVE' : status === 'configured' ? 'CONFIGURED' : 'AVAILABLE';
-      const id = r.frontmatter.id.padEnd(18);
-      const desc = r.frontmatter.description.slice(0, 30).padEnd(30);
-      console.log(`  ${id}${desc}${statusStr}`);
-    }
-  }
+  // Dashboard view
+  printSection('INFRASTRUCTURE (set up first)', infra);
+  printSection('SENSES (data inputs)', senses);
+  printSection('REFLEXES (automated responses)', reflexes);
 
   // Stats summary
   const allHeartbeats = recipes.flatMap(r => readHeartbeat(r.frontmatter.id));
