@@ -19,30 +19,36 @@ GBrain is designed to be installed and operated by an AI agent. If you don't hav
 Copy this block into OpenClaw, Hermes Agent, or Claude Code. The agent will install GBrain, set up the brain schema, import your files, configure all integrations, and verify everything works.
 
 ```
-GOAL: I want Garry's exact opinionated Claude Code or Hermes Agent
-setup. Get me there. Install GBrain, set up the brain schema, import
-my files, configure all integrations, and verify everything works.
-Do not skip steps. Verify each step before proceeding. If a step
-fails, stop and fix it.
+GOAL: I want Garry Tan's exact opinionated AI agent setup. Get me
+there. Install GBrain, set up the brain schema, import my files,
+configure all integrations, and verify everything works. Do not skip
+steps. Verify each step before proceeding. If a step fails, stop
+and fix it.
 
-**You don't need a server to start.** `gbrain init` now defaults to PGLite -- embedded Postgres 17.5 running via WASM, right on your machine. No Supabase account, no Docker, no connection strings. One command and you have a full Postgres brain with pgvector, hybrid search, and all 37 operations. When your brain outgrows local (1,000+ files), `gbrain migrate --to supabase` moves everything to managed Postgres in one shot.
+You don't need a server to start. gbrain init defaults to PGLite
+(embedded Postgres 17.5 via WASM). No Supabase account, no Docker,
+no connection strings. One command and you have a full Postgres brain
+with pgvector, hybrid search, and all 37 operations. When your brain
+outgrows local (1000+ files), gbrain migrate --to supabase moves
+everything to managed Postgres in one shot.
 
-The knowledge model is just markdown files in a git repo. The [skills](docs/GBRAIN_SKILLPACK.md) and [schema](docs/GBRAIN_RECOMMENDED_SCHEMA.md) work with any AI agent that can read and write files.
+The knowledge model is markdown files in a git repo. Read
+docs/GBRAIN_SKILLPACK.md for the full agent playbook and
+docs/GBRAIN_RECOMMENDED_SCHEMA.md for the brain directory structure.
 
 STEP 1 — INSTALL
   curl -fsSL https://bun.sh/install | bash && source ~/.bashrc
   bun add github:garrytan/gbrain
   Verify: gbrain --version
 
-STEP 2 — START HERE
+STEP 2 — DATABASE
   Run: gbrain init
-  This creates a local PGLite brain (embedded Postgres, no server needed).
+  This creates a local PGLite brain (embedded Postgres, no server).
   Brain ready in ~2 seconds. No accounts, no connection strings.
   Verify: gbrain doctor --json (all checks pass)
-  
-  For large brains (1000+ files) or remote access, use Supabase instead:
+
+  For large brains (1000+ files) or remote access, use Supabase:
     gbrain init --supabase
-    Then provide your Supabase Shared Pooler connection string.
   You can migrate anytime: gbrain migrate --to supabase
 
 STEP 3 — SCHEMA
