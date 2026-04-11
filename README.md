@@ -25,11 +25,9 @@ I was setting up my [OpenClaw](https://openclaw.ai) agent and started a markdown
 
 This is what I actually use day to day. The agent runs while I sleep... literally. The dream cycle scans every conversation from the day, enriches missing entities, fixes broken citations, and consolidates memory. I wake up and the brain is smarter than when I went to sleep. OpenClaw ships this as DREAMS.md. Hermes Agent can do the same with a nightly cron job (see the [cron schedule guide](docs/guides/cron-schedule.md) for setup).
 
-**You don't need a cloud database to start.** The knowledge model is just markdown files in a git repo. The [skills](docs/GBRAIN_SKILLPACK.md) and [schema](docs/GBRAIN_RECOMMENDED_SCHEMA.md) work with any AI agent that can read and write files. Start there.
+**You don't need Postgres to start.** The knowledge model is just markdown files in a git repo. The [skills](docs/GBRAIN_SKILLPACK.md) and [schema](docs/GBRAIN_RECOMMENDED_SCHEMA.md) work with any AI agent that can read and write files. Start there.
 
 I added Postgres + pgvector later because at 1,000 to 10,000 long markdown docs, `grep` stops working. You need real chunking, real retrieval, real search. GBrain is the thin CLI and MCP layer I built on top of Postgres to solve that, optimized for OpenClaw and smart agents.
-
-**The upgrade path:** GBrain uses [PGLite](https://pglite.dev) (Postgres compiled to WASM with pgvector built in) so you can run the full search engine locally, zero infrastructure, nothing to install. When you're ready for more, move up to [Supabase](https://supabase.com) or your own hosted Postgres for connection pooling, higher concurrency, and the ability for Claude Desktop, Claude Code, Cowork, ChatGPT, Perplexity Computer, or any MCP-compatible AI agent to connect to your brain remotely.
 
 ### Ask it anything
 
