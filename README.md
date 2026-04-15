@@ -179,9 +179,9 @@ Run `gbrain integrations` to see status.
 
 ## GBrain + GStack
 
-GStack is the engine. GBrain is the mod.
+[GStack](https://github.com/garrytan/gstack) is the engine. GBrain is the mod.
 
-- **GStack** = coding skills (ship, review, QA, investigate, office-hours, retro). 28 skills across 8 agent hosts. When your agent codes on itself, it uses GStack.
+- **[GStack](https://github.com/garrytan/gstack)** = coding skills (ship, review, QA, investigate, office-hours, retro). 70,000+ stars, 30,000 developers per day. When your agent codes on itself, it uses GStack.
 - **GBrain** = everything-else skills (brain ops, signal detection, ingestion, enrichment, cron, reports, identity). When your agent remembers, thinks, and operates, it uses GBrain.
 - **`hosts/gbrain.ts`** = the bridge. Tells GStack's coding skills to check the brain before coding.
 
