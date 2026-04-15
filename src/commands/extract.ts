@@ -10,6 +10,7 @@
 import { readFileSync, readdirSync, lstatSync, existsSync } from 'fs';
 import { join, relative, dirname } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
+import { parseMarkdown } from '../core/markdown.ts';
 
 // --- Types ---
 
@@ -107,22 +108,14 @@ function extractFrontmatterLinks(slug: string, fm: Record<string, unknown>): Ext
   return links;
 }
 
-/** Parse YAML-like frontmatter (lightweight) */
-function parseFrontmatter(content: string): Record<string, unknown> {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return {};
-  const fm: Record<string, unknown> = {};
-  for (const line of match[1].split('\n')) {
-    const kv = line.match(/^(\w+):\s*(.+)$/);
-    if (!kv) continue;
-    const val = kv[2].trim();
-    if (val.startsWith('[') && val.endsWith(']')) {
-      fm[kv[1]] = val.slice(1, -1).split(',').map(s => s.trim().replace(/^["']|["']$/g, ''));
-    } else {
-      fm[kv[1]] = val.replace(/^["']|["']$/g, '');
-    }
+/** Parse frontmatter using the project's gray-matter-based parser */
+function parseFrontmatterFromContent(content: string, relPath: string): Record<string, unknown> {
+  try {
+    const parsed = parseMarkdown(content, relPath);
+    return parsed.frontmatter;
+  } catch {
+    return {};
   }
-  return fm;
 }
 
 /** Full link extraction from a single markdown file */
@@ -132,7 +125,7 @@ export function extractLinksFromFile(
   const links: ExtractedLink[] = [];
   const slug = relPath.replace('.md', '');
   const fileDir = dirname(relPath);
-  const fm = parseFrontmatter(content);
+  const fm = parseFrontmatterFromContent(content, relPath);
 
   for (const { name, relTarget } of extractMarkdownLinks(content)) {
     const resolved = join(fileDir, relTarget).replace('.md', '');
