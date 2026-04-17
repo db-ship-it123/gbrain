@@ -8,10 +8,12 @@ import { resolve, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
+import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
 import { hybridSearch } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
+import { extractPageLinks, isAutoLinkEnabled } from './link-extraction.ts';
 import * as db from './db.ts';
 
 // --- Types ---
@@ -219,7 +221,7 @@ const get_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, and reconciles tags.',
+  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link is enabled) extracts + reconciles graph links.',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
@@ -227,11 +229,94 @@ const put_page: Operation = {
   mutating: true,
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug };
-    const result = await importFromContent(ctx.engine, p.slug as string, p.content as string);
-    return { slug: result.slug, status: result.status === 'imported' ? 'created_or_updated' : result.status, chunks: result.chunks };
+    const slug = p.slug as string;
+    // Skip embedding when no OpenAI key is configured. importFromContent's existing
+    // try/catch around embed only catches; without a key the OpenAI client would
+    // attempt 5 retries with exponential backoff (up to ~2 minutes total) before
+    // giving up. Detect early.
+    const noEmbed = !process.env.OPENAI_API_KEY;
+    const result = await importFromContent(ctx.engine, slug, p.content as string, { noEmbed });
+
+    // Auto-link post-hook: runs AFTER importFromContent (which is its own
+    // transaction). Runs even on status='skipped' so reconciliation catches drift
+    // between the page text and the links table. Failures are non-blocking.
+    let autoLinks: { created: number; removed: number; errors: number } | { error: string } | undefined;
+    if (result.parsedPage) {
+      try {
+        const enabled = await isAutoLinkEnabled(ctx.engine);
+        if (enabled) {
+          autoLinks = await runAutoLink(ctx.engine, slug, result.parsedPage);
+        }
+      } catch (e) {
+        autoLinks = { error: e instanceof Error ? e.message : String(e) };
+      }
+    }
+
+    return {
+      slug: result.slug,
+      status: result.status === 'imported' ? 'created_or_updated' : result.status,
+      chunks: result.chunks,
+      ...(autoLinks ? { auto_links: autoLinks } : {}),
+    };
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
 };
+
+/**
+ * Extract entity refs from a freshly-written page, sync the links table to match.
+ * Creates new links via addLink, removes stale ones (links present in DB but no
+ * longer referenced in content) via removeLink. Returns counts.
+ *
+ * Runs OUTSIDE importFromContent's transaction so it doesn't block the page write
+ * or get rolled back if a single link operation fails. Per-link failures are
+ * counted; the overall function never throws (catch in put_page handler covers
+ * extraction errors).
+ */
+async function runAutoLink(
+  engine: BrainEngine,
+  slug: string,
+  parsed: { type: PageType; compiled_truth: string; timeline: string; frontmatter: Record<string, unknown> },
+): Promise<{ created: number; removed: number; errors: number }> {
+  const fullContent = parsed.compiled_truth + '\n' + parsed.timeline;
+  const candidates = extractPageLinks(fullContent, parsed.frontmatter, parsed.type);
+
+  // Resolve which targets exist (skip refs to non-existent pages to avoid FK
+  // violation churn in addLink). One getAllSlugs call upfront, O(1) lookup.
+  const allSlugs = await engine.getAllSlugs();
+  const valid = candidates.filter(c => allSlugs.has(c.targetSlug));
+
+  // Reconciliation: load existing outgoing links, diff with desired set.
+  const existing = await engine.getLinks(slug);
+  const desiredKeys = new Set(valid.map(c => `${c.targetSlug}\u0000${c.linkType}`));
+  const existingKeys = new Set(existing.map(l => `${l.to_slug}\u0000${l.link_type}`));
+
+  let created = 0, removed = 0, errors = 0;
+
+  // Add new + update existing.
+  for (const c of valid) {
+    try {
+      await engine.addLink(slug, c.targetSlug, c.context, c.linkType);
+      if (!existingKeys.has(`${c.targetSlug}\u0000${c.linkType}`)) created++;
+    } catch {
+      errors++;
+    }
+  }
+
+  // Remove stale (in DB but not in desired set).
+  for (const l of existing) {
+    const key = `${l.to_slug}\u0000${l.link_type}`;
+    if (!desiredKeys.has(key)) {
+      try {
+        await engine.removeLink(slug, l.to_slug, l.link_type);
+        removed++;
+      } catch {
+        errors++;
+      }
+    }
+  }
+
+  return { created, removed, errors };
+}
 
 const delete_page: Operation = {
   name: 'delete_page',
@@ -426,13 +511,24 @@ const get_backlinks: Operation = {
 
 const traverse_graph: Operation = {
   name: 'traverse_graph',
-  description: 'Traverse link graph from a page',
+  description: 'Traverse link graph from a page. With link_type/direction, returns edges (GraphPath[]) instead of nodes.',
   params: {
     slug: { type: 'string', required: true },
     depth: { type: 'number', description: 'Max traversal depth (default 5)' },
+    link_type: { type: 'string', description: 'Filter to one link type (per-edge filter, traversal only follows matching edges)' },
+    direction: { type: 'string', enum: ['in', 'out', 'both'], description: 'Traversal direction (default out)' },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.traverseGraph(p.slug as string, (p.depth as number) || 5);
+    const slug = p.slug as string;
+    const depth = (p.depth as number) || 5;
+    const linkType = p.link_type as string | undefined;
+    const direction = p.direction as 'in' | 'out' | 'both' | undefined;
+    // Backward compat: when neither link_type nor direction is provided, return
+    // the legacy GraphNode[] shape. Once either is set, switch to GraphPath[].
+    if (linkType === undefined && direction === undefined) {
+      return ctx.engine.traverseGraph(slug, depth);
+    }
+    return ctx.engine.traversePaths(slug, { depth, linkType, direction });
   },
   cliHints: { name: 'graph', positional: ['slug'] },
 };
