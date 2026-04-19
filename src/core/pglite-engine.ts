@@ -442,19 +442,20 @@ export class PGLiteEngine implements BrainEngine {
     dirPrefix?: string,
     minSimilarity: number = 0.55,
   ): Promise<{ slug: string; similarity: number } | null> {
-    // Session-level GUC so the `%` operator uses this threshold. PGLite
-    // supports pg_trgm per the schema ext. If the GIN index is unavailable
-    // (older PGLite), the query still works — just slower (seq scan).
-    await this.db.query(`SET LOCAL pg_trgm.similarity_threshold = $1`, [minSimilarity]);
+    // Inline threshold comparison instead of `SET LOCAL pg_trgm.similarity_threshold`.
+    // The GUC only scopes to the current transaction and pglite auto-commits each
+    // .query() call, so the SET LOCAL would be a no-op. Using similarity() >= $N
+    // directly gives predictable behavior. Tie-breaker: sort by slug so re-runs
+    // pick the same winner.
     const prefixPattern = dirPrefix ? `${dirPrefix}/%` : '%';
     const { rows } = await this.db.query(
       `SELECT slug, similarity(title, $1) AS sim
        FROM pages
-       WHERE title % $1
+       WHERE similarity(title, $1) >= $3
          AND slug LIKE $2
-       ORDER BY sim DESC
+       ORDER BY sim DESC, slug ASC
        LIMIT 1`,
-      [name, prefixPattern]
+      [name, prefixPattern, minSimilarity]
     );
     if (rows.length === 0) return null;
     const row = rows[0] as { slug: string; sim: number };

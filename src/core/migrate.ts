@@ -302,6 +302,20 @@ export const MIGRATIONS: Migration[] = [
     //
     // Idempotent via IF NOT EXISTS / DROP IF EXISTS.
     sql: `
+      -- Postgres version gate: UNIQUE NULLS NOT DISTINCT requires PG15+.
+      -- PGLite ships PG17.5, current Supabase is PG15+. Old Supabase projects
+      -- on PG14 hit an explicit error rather than half-applying (drop old
+      -- constraint but fail to add new one → brain loses uniqueness guarantee).
+      DO $$ BEGIN
+        IF current_setting('server_version_num')::int < 150000 THEN
+          RAISE EXCEPTION
+            'v0.13 migration requires Postgres 15+. Current: %. '
+            'Upgrade your Postgres (Supabase: migrate project to a newer PG major). '
+            'This migration intentionally stops before touching the schema to preserve data integrity.',
+            current_setting('server_version');
+        END IF;
+      END $$;
+
       ALTER TABLE links ADD COLUMN IF NOT EXISTS link_source TEXT;
       DO $$ BEGIN
         IF NOT EXISTS (
@@ -314,6 +328,13 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE links ADD COLUMN IF NOT EXISTS origin_page_id INTEGER
         REFERENCES pages(id) ON DELETE SET NULL;
       ALTER TABLE links ADD COLUMN IF NOT EXISTS origin_field TEXT;
+      -- Backfill NULL link_source → 'markdown' for existing rows. Codex review
+      -- caught that without this, pre-v0.13 legacy rows coexist with new
+      -- 'markdown' writes under NULLS NOT DISTINCT (NULL ≠ 'markdown'),
+      -- causing duplicate edges to accumulate. Treating legacy as markdown
+      -- is the accurate best-guess: pre-v0.13 auto-link only emitted markdown
+      -- edges. User-created 'manual' edges are a v0.13+ concept anyway.
+      UPDATE links SET link_source = 'markdown' WHERE link_source IS NULL;
       ALTER TABLE links DROP CONSTRAINT IF EXISTS links_from_to_type_unique;
       DO $$ BEGIN
         IF NOT EXISTS (

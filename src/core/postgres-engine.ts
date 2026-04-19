@@ -497,18 +497,23 @@ export class PostgresEngine implements BrainEngine {
     minSimilarity: number = 0.55,
   ): Promise<{ slug: string; similarity: number } | null> {
     const sql = this.sql;
-    // Set similarity threshold for this statement (per-session GUC).
-    // The `%` operator respects pg_trgm.similarity_threshold; setting it at
-    // query time lets the GIN index drive the match, then we sort by score
-    // and pick the top one.
-    await sql`SET LOCAL pg_trgm.similarity_threshold = ${minSimilarity}`;
+    // Use the `similarity()` function directly with an explicit threshold
+    // comparison. DO NOT use `SET LOCAL pg_trgm.similarity_threshold` +
+    // the `%` operator here — postgres.js auto-commits each sql`` call
+    // so `SET LOCAL` is a no-op across statement boundaries. Inline
+    // comparison is the only way to get predictable threshold behavior
+    // without wrapping the caller in a transaction.
+    //
+    // Tie-breaker: sort by slug after similarity so re-runs return the
+    // same winner when multiple pages score equally (prevents churn
+    // in put_page auto-link reconciliation).
     const prefixPattern = dirPrefix ? `${dirPrefix}/%` : '%';
     const rows = await sql`
       SELECT slug, similarity(title, ${name}) AS sim
       FROM pages
-      WHERE title % ${name}
+      WHERE similarity(title, ${name}) >= ${minSimilarity}
         AND slug LIKE ${prefixPattern}
-      ORDER BY sim DESC
+      ORDER BY sim DESC, slug ASC
       LIMIT 1
     `;
     if (rows.length === 0) return null;
