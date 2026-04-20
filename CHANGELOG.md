@@ -2,6 +2,77 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.15.0] - 2026-04-20
+
+## **BrainBench v1 lands as a public benchmark. 4 adapters scored side-by-side, graph layer worth +31 points P@5.**
+## **Portable JSON schemas at `eval/schemas/` make v2 (Python + Inspect AI + Docker) a driver swap, not a rewrite.**
+
+gbrain has had retrieval metrics for two versions. This release turns them into a reproducible benchmark anyone can run. `bun run eval:run` scores 4 adapters against each other on a 240-page Opus-generated rich-prose corpus: gbrain-after (the stack), ripgrep-bm25 (classic IR baseline), vector-only (commodity RAG, same embedder), and hybrid-nograph (gbrain with the graph disabled — same codebase, same embedder, same chunking, graph just turned off). The graph layer does the work. Graph on → P@5 49.1%. Graph off → P@5 17.8%. Everything else held constant.
+
+This release also lands the foundations for BrainBench v1 Complete (Cats 5/6/8/9/11 ship in follow-up PRs). Six portable JSON schemas at `eval/schemas/` — corpus manifest, public probe, tool surface, transcript, scorecard, evidence contract — pin the v1→v2 boundary. When v2 ports to Python + Inspect AI Agent Bridge + Docker sandbox, same fixtures and same tool contracts, zero rework. Eight gold file templates at `eval/data/gold/` scaffold the sealed qrels, adversarial perturbations, and citation labels that Cat 5/8/9 will fill in. A deterministic `amara-life-v1` skeleton generator produces the fictional messy-week corpus (50 emails, 300 Slack messages across 4 channels, 20 calendar events, 8 meeting transcripts, 40 first-person notes) with 10 contradictions + 5 stale facts + 5 poison items + 3 implicit preferences planted at fixed positions so gold files can cross-reference by fixture_id. An Opus prose generator with structured cache keys (sha256 over schema_version + template_hash + item_spec_hash) makes regeneration cheap and resilient to prompt tweaks.
+
+### The numbers that matter
+
+Measured by `bun run eval:run` (4 adapters × N=5 runs on the 240-page `world-v1` corpus). Reproducible; no API keys at run time; ~12 min wall clock on an M3 laptop.
+
+| Adapter                                     | P@5        | R@5        | MRR    | Δ P@5 vs gbrain-after |
+|---------------------------------------------|------------|------------|--------|------------------------|
+| **gbrain-after** (PGLite + graph + hybrid)  | **49.1%**  | **97.9%**  | **0.81** | baseline               |
+| hybrid-nograph (gbrain minus graph)         | 17.8%      | 65.1%      | 0.41   | **−31.4 pts**          |
+| ripgrep-bm25 (classic IR)                   | 17.1%      | 62.4%      | 0.34   | −32.0 pts              |
+| vector-only (cosine, same embedder)         | 10.7%      | 40.7%      | 0.22   | −38.4 pts              |
+
+Historical regression comparison (v0.11.1 → v0.12.1, same harness, same queries):
+
+| Metric               | v0.11.1   | v0.12.1   | Δ             |
+|----------------------|-----------|-----------|---------------|
+| gbrain-after P@5     | 22.1%     | **49.1%** | **+27.0 pts** |
+| gbrain-after R@5     | 54.6%     | **97.9%** | **+43.3 pts** |
+| Typed links (extract)| 136       | **499**   | **×3.7**      |
+| Timeline entries     | 27        | **2,208** | **×82**       |
+
+On v0.11.1, gbrain-after beat hybrid-nograph by only 4.3 points P@5. v0.12's extract upgrades (typed links ×3.7, timeline entries ×82) drove the jump to 31 points. The graph layer plus high-quality extraction together are load-bearing. Either piece alone moves the needle a few points. Both pieces, +31 P@5.
+
+### What this means for external researchers
+
+If you're benchmarking personal-knowledge agent stacks, this is the first public apples-to-apples harness. Clone gbrain, `bun install && bun run eval:run`, get a scorecard in ~12 minutes. Add a new adapter at `eval/runner/adapters/*.ts` implementing the 167-line `Adapter` interface and score your stack side-by-side with four references.
+
+If you're porting BrainBench to a different driver (Python + Inspect AI + Docker in v2), read `eval/schemas/*.schema.json`. That's the contract boundary. Same corpus manifest, same public probes (gold stripped), same 12 read + 3 dry_run tools, same transcript format, same scorecard. Different driver, same benchmark.
+
+### Itemized changes
+
+**BrainBench v1 public benchmark:**
+- 4-adapter side-by-side scorecard at `eval/runner/multi-adapter.ts` with N=5 tolerance bands and seeded query order. Adapters: `ripgrep-bm25.ts`, `vector-only.ts`, `hybrid-nograph.ts`, and inline `gbrain-after`.
+- Tier 5 fuzzy queries (30 vague-recall probes) + Tier 5.5 synthetic outsider queries (50 AI-authored with provenance labels) at `eval/runner/queries/`.
+- Query schema validator at `eval/runner/queries/validator.ts` with temporal `as_of_date` enforcement.
+- Per-link-type accuracy runner at `eval/runner/type-accuracy.ts` on the 240-page rich-prose corpus (Cat 2).
+- Static HTML world explorer (`bun run eval:world:view`) for the fictional corpus.
+- PGLite teardown fix so `bun run eval:run` exits 0 cleanly.
+- `inferLinkType` prose precision: `works_at` and `advises` regex tightening (partial; remaining residuals tracked in TODOS.md).
+- Contributor docs at `eval/CONTRIBUTING.md`, `eval/RUNBOOK.md`, `eval/CREDITS.md`.
+
+**BrainBench v1 Complete foundations (new):**
+- 6 portable JSON schemas at `eval/schemas/*.schema.json`: corpus-manifest, public-probe, tool-schema (pinned 12 read + 3 dry_run tools, 32K tool-output cap), transcript, scorecard (N ∈ {1, 5, 10}), evidence-contract.
+- 8 gold file templates at `eval/data/gold/*.json`: entities, backlinks, qrels, contradictions, poison, personalization-rubric, implicit-preferences, citations.
+- `eval/generators/amara-life.ts` — deterministic procedural skeleton. 15 contacts picked from `world-v1`, 50+300+20+8+40 items across the formats. Mulberry32 seeded PRNG; byte-identical under reseed. Plants 10 contradictions + 5 stale facts + 5 poison items + 3 implicit preferences at deterministic positions.
+- `eval/generators/amara-life-gen.ts` — Opus prose expansion with structured cache key `sha256({schema_version, template_id, template_hash, model_id, model_params, seed, item_spec_hash})`. Cost-gated at $20 hard-stop. Writes `inbox/emails.jsonl`, `slack/messages.jsonl`, `calendar.ics`, `meetings/*.md`, `notes/*.md`, `docs/*.md`, plus `corpus-manifest.json`. Dry-run mode available for smoke testing the pipeline without LLM spend.
+- `Page.type` enum extended in both `src/core/types.ts` and `eval/runner/types.ts` with `email | slack | calendar-event | note` (+ `meeting` on the production side). `src/core/markdown.ts` `inferType()` heuristics updated.
+- 75 new tests at `test/eval/` covering: schema round-trip + coherence (48), skeleton determinism + perturbation counts + slug regex conformance (17), cache-key invalidation across schema/template/model/seed changes (10). All pass, 727 expect() calls, 33ms.
+- New scripts in `package.json`: `eval:generate-amara-life`, `eval:generate-amara-life:dry`. `test:eval` extended to include `test/eval/`.
+
+**Benchmark reports committed:**
+- `docs/benchmarks/2026-04-19-brainbench-multi-adapter.md` — 4-adapter scorecard with full config card.
+- `docs/benchmarks/2026-04-19-brainbench-v0_11-vs-v0_12.md` — regression comparison isolating the v0.12 extract-quality contribution.
+
+**Review pipeline for this PR:**
+- CEO Review (SCOPE_EXPANSION) — 6 expansions proposed, 6 accepted.
+- Eng Review (FULL_REVIEW) — 7 issues surfaced and resolved in the plan.
+- Codex Review — 21 findings, 11 P0/P1 incorporated into Revision 3 of the plan. Cross-model agreement rate 9% (91% of Codex's findings were unique to Codex).
+
+**Tests:** 1471 → **1796 pass** (+325 from master merges), 0 failures, 179 skipped (E2E requiring `DATABASE_URL`).
+
+**Deferred to follow-up PRs:** Day 3b corpus generation (~$15 Opus, user-run), Days 4-10 (pdf-parse + flight-recorder + tool-bridge + agent adapter + judge + Cat 5/6/8/9/11 runners + sealed-qrels enforcement + `all.ts` rewrite). See `/Users/garrytan/.claude/plans/` for the full plan.
+
 ## [0.14.0] - 2026-04-20
 
 ## **Move gateway crons to Minions. Zero LLM tokens per cron fire.**
