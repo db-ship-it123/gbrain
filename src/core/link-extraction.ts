@@ -27,16 +27,41 @@ export interface EntityRef {
 }
 
 /**
- * Match `[Name](path)` markdown links pointing to `people/` or `companies/`
- * (and other entity directories). Accepts both filesystem-relative format
- * (`[Name](../people/slug.md)`) AND engine-slug format (`[Name](people/slug)`).
+ * Directory prefix whitelist. These are the top-level slug dirs the extractor
+ * recognizes as entity references. Upstream canonical + our extensions:
+ *   - Gbrain canonical: people, companies, meetings, concepts, deal, civic, project, source, media, yc, projects
+ *   - Our domain extensions: tech, finance, personal, openclaw (domain-organized wikis)
+ *   - Our entity prefix: entities (we kept some legacy entities/projects/ pages)
+ */
+const DIR_PATTERN = '(?:people|companies|meetings|concepts|deal|civic|project|projects|source|media|yc|tech|finance|personal|openclaw|entities)';
+
+/**
+ * Match `[Name](path)` markdown links pointing to entity directories.
+ * Accepts both filesystem-relative format (`[Name](../people/slug.md)`)
+ * AND engine-slug format (`[Name](people/slug)`).
  *
- * Captures: name, dir (people/companies/...), slug.
+ * Captures: name, slug (dir/name, possibly deeper).
  *
  * The regex permits an optional `../` prefix (any number) and an optional
  * `.md` suffix so the same function works for both filesystem and DB content.
  */
-const ENTITY_REF_RE = /\[([^\]]+)\]\((?:\.\.\/)*((?:people|companies|meetings|concepts|deal|civic|project|source|media|yc)\/([^)\s]+?))(?:\.md)?\)/g;
+const ENTITY_REF_RE = new RegExp(
+  `\\[([^\\]]+)\\]\\((?:\\.\\.\\/)*(${DIR_PATTERN}\\/[^)\\s]+?)(?:\\.md)?\\)`,
+  'g',
+);
+
+/**
+ * Match Obsidian-style `[[path]]` or `[[path|Display Text]]` wikilinks.
+ * Captures: slug (dir/...), displayName (optional).
+ *
+ * Same dir whitelist as ENTITY_REF_RE. Strips trailing `.md`, strips section
+ * anchors (`#heading`), skips external URLs. Wiki KBs use this format almost
+ * exclusively so missing it leaves the graph empty.
+ */
+const WIKILINK_RE = new RegExp(
+  `\\[\\[(${DIR_PATTERN}\\/[^|\\]#]+?)(?:#[^|\\]]*?)?(?:\\|([^\\]]+?))?\\]\\]`,
+  'g',
+);
 
 /**
  * Strip fenced code blocks (```...```) and inline code (`...`) from markdown,
@@ -84,28 +109,77 @@ function stripCodeBlocks(content: string): string {
 export function extractEntityRefs(content: string): EntityRef[] {
   const stripped = stripCodeBlocks(content);
   const refs: EntityRef[] = [];
-  let m: RegExpExecArray | null;
-  // Fresh regex per call (g-flag state is per-instance).
-  const re = new RegExp(ENTITY_REF_RE.source, ENTITY_REF_RE.flags);
-  while ((m = re.exec(stripped)) !== null) {
-    const name = m[1];
-    const fullPath = m[2];
-    const slug = fullPath; // dir/slug
+  let match: RegExpExecArray | null;
+
+  // 1. Markdown links: [Name](path)
+  const mdPattern = new RegExp(ENTITY_REF_RE.source, ENTITY_REF_RE.flags);
+  while ((match = mdPattern.exec(stripped)) !== null) {
+    const name = match[1];
+    const fullPath = match[2];
+    const slug = fullPath;
     const dir = fullPath.split('/')[0];
     refs.push({ name, slug, dir });
   }
+
+  // 2. Obsidian wikilinks: [[path]] or [[path|Display Text]]
+  const wikiPattern = new RegExp(WIKILINK_RE.source, WIKILINK_RE.flags);
+  while ((match = wikiPattern.exec(stripped)) !== null) {
+    let slug = match[1].trim();
+    if (!slug) continue;
+    if (slug.includes('://')) continue;
+    if (slug.endsWith('.md')) slug = slug.slice(0, -3);
+    const displayName = (match[2] || slug).trim();
+    const dir = slug.split('/')[0];
+    refs.push({ name: displayName, slug, dir });
+  }
+
   return refs;
 }
 
 // ─── Link candidates (richer than EntityRef) ────────────────────
 
 export interface LinkCandidate {
+  /**
+   * Source page slug for the edge. When omitted, callers default to
+   * "the page being written" (operations.ts runAutoLink) or "the page
+   * currently being processed" (extract.ts). Explicitly set when
+   * frontmatter emits an incoming edge — e.g. a company page's
+   * `key_people: [pedro-franceschi]` produces a candidate whose
+   * fromSlug is `people/pedro-franceschi`, not the company.
+   */
+  fromSlug?: string;
   /** Target page slug (no .md, no ../). */
   targetSlug: string;
   /** Inferred relationship type. */
   linkType: string;
   /** Surrounding text (up to ~80 chars) used for inference + storage. */
   context: string;
+  /**
+   * Provenance (v0.13+). Defaults to 'markdown' on older call sites;
+   * frontmatter-derived candidates set 'frontmatter'; user-created edges
+   * via explicit API pass 'manual'.
+   */
+  linkSource?: string;
+  /**
+   * Origin-page slug. Only populated for link_source='frontmatter' so
+   * reconciliation can scope cleanups to edges THIS page's frontmatter
+   * created (never touching edges other pages authored).
+   */
+  originSlug?: string;
+  /** Frontmatter field name (e.g. 'key_people'), for debug + unresolved report. */
+  originField?: string;
+}
+
+/**
+ * Result of extractPageLinks. `candidates` includes markdown refs + bare
+ * slug refs + frontmatter-derived edges (v0.13). `unresolved` lists
+ * frontmatter names that did not resolve to any page — surfaced in the
+ * put_page auto_links response and the extract summary so users know
+ * where the graph has holes.
+ */
+export interface PageLinksResult {
+  candidates: LinkCandidate[];
+  unresolved: UnresolvedFrontmatterRef[];
 }
 
 /**
@@ -114,16 +188,24 @@ export interface LinkCandidate {
  * Sources:
  *   1. Markdown entity refs in compiled_truth + timeline (extractEntityRefs).
  *   2. Bare slug references in text (people/slug, companies/slug).
- *   3. Frontmatter `source:` field (creates a 'source' link).
+ *   3. Frontmatter fields → typed graph edges (v0.13: company, investors,
+ *      attendees, key_people, etc.). See FRONTMATTER_LINK_MAP.
  *
- * Within-page dedup: multiple mentions of the same (targetSlug, linkType)
- * collapse to one candidate. The first occurrence's context wins.
+ * ASYNC (v0.13): frontmatter extraction resolves display names to slugs
+ * via the supplied resolver, which may hit the DB. Pre-v0.13 callers
+ * that don't care about frontmatter can pass a resolver that always
+ * returns null; only markdown/bare-slug candidates are emitted.
+ *
+ * Within-page dedup: multiple mentions of the same (fromSlug, targetSlug,
+ * linkType) tuple collapse to one candidate. First occurrence wins.
  */
-export function extractPageLinks(
+export async function extractPageLinks(
+  slug: string,
   content: string,
   frontmatter: Record<string, unknown>,
   pageType: PageType,
-): LinkCandidate[] {
+  resolver: SlugResolver,
+): Promise<PageLinksResult> {
   const candidates: LinkCandidate[] = [];
 
   // 1. Markdown entity refs.
@@ -138,6 +220,7 @@ export function extractPageLinks(
       targetSlug: ref.slug,
       linkType: inferLinkType(pageType, context, content, ref.slug),
       context,
+      linkSource: 'markdown',
     });
   }
 
@@ -145,7 +228,10 @@ export function extractPageLinks(
   // Limited to the same entity directories ENTITY_REF_RE covers.
   // Code blocks are stripped first — slugs in code samples are not real refs.
   const strippedContent = stripCodeBlocks(content);
-  const bareRe = /\b((?:people|companies|meetings|concepts|deal|civic|project|source|media|yc)\/[a-z0-9][a-z0-9-]*)\b/g;
+  const bareRe = new RegExp(
+    `\\b(${DIR_PATTERN}\\/[a-z0-9][a-z0-9/-]*[a-z0-9])\\b`,
+    'g',
+  );
   let m: RegExpExecArray | null;
   while ((m = bareRe.exec(strippedContent)) !== null) {
     // Skip matches that are part of a markdown link (already handled above).
@@ -156,30 +242,26 @@ export function extractPageLinks(
       targetSlug: m[1],
       linkType: inferLinkType(pageType, context, content, m[1]),
       context,
+      linkSource: 'markdown',
     });
   }
 
-  // 3. Frontmatter source field.
-  const source = frontmatter.source;
-  if (typeof source === 'string' && source.length > 0 && /^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(source)) {
-    candidates.push({
-      targetSlug: source,
-      linkType: 'source',
-      context: `frontmatter source: ${source}`,
-    });
-  }
+  // 3. Frontmatter-derived edges (v0.13). Includes the legacy `source:`
+  // field along with the full field map.
+  const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver);
+  candidates.push(...fm.candidates);
 
-  // Within-page dedup: same (targetSlug, linkType) collapses to one entry.
-  // First occurrence wins (preserves the most natural/earliest context).
+  // Within-page dedup: same (fromSlug, targetSlug, linkType, linkSource)
+  // collapses to one entry. First occurrence wins.
   const seen = new Set<string>();
   const result: LinkCandidate[] = [];
   for (const c of candidates) {
-    const key = `${c.targetSlug}\u0000${c.linkType}`;
+    const key = `${c.fromSlug ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(c);
   }
-  return result;
+  return { candidates: result, unresolved: fm.unresolved };
 }
 
 /** Excerpt a window of `width` chars around `idx`, collapsed to one line. */
@@ -314,6 +396,272 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
   return 'mentions';
 }
 
+// ─── Frontmatter link extraction (v0.13) ────────────────────────
+//
+// YAML frontmatter on entity pages carries rich relationship data:
+//
+//   company: "Stripe"                       # person page
+//   companies: [Stripe, Plaid]              # person page (alias of company)
+//   key_people: [Patrick Collison, John]    # company page (incoming works_at)
+//   investors: [{name: Sequoia}, Benchmark] # deal page (incoming invested_in)
+//   attendees: [Pedro, Garry]               # meeting page (incoming attended)
+//
+// Each maps to a typed graph edge. The mapping lives here (one source of
+// truth) so the three entry points — operations.ts auto-link, extract.ts
+// fs source, extract.ts db source — emit identical edges for the same
+// frontmatter. This is the point of the v0.13 rewrite.
+//
+// DIRECTION: "incoming" means the page being written is the TO side;
+// the FROM side is the resolved frontmatter value. E.g. `key_people:
+// [Pedro]` on company/stripe emits `people/pedro -> companies/stripe
+// type=works_at`, preserving subject-of-verb semantics for graph reads.
+//
+// MULTI-DIR HINTS: investors can be companies, funds, or people. The
+// resolver tries each hint in order and takes the first match.
+
+export interface FrontmatterFieldMapping {
+  /** Field name(s). Multiple entries are aliases (e.g. company + companies). */
+  fields: string[];
+  /**
+   * Only applies when page.type matches. Omitted = any page type. String
+   * (not PageType) because some page types like 'meeting' exist in the
+   * pages table without being in the TypeScript PageType enum.
+   */
+  pageType?: string;
+  /** Edge link_type. */
+  type: string;
+  /** 'outgoing' = page→target. 'incoming' = target→page (subject of verb = from). */
+  direction: 'outgoing' | 'incoming';
+  /**
+   * Target directory hints for slug resolution. Single string or ordered
+   * array; resolver tries each. E.g. investors → ['companies', 'funds', 'people'].
+   */
+  dirHint: string | string[];
+}
+
+/**
+ * Canonical field → (type, direction, dir-hint) map. Consulted by
+ * extractFrontmatterLinks for every YAML field on every written page.
+ *
+ * NOT normalization: kept as a flat array so duplicate field names with
+ * different pageType filters coexist cleanly (vs an object-literal which
+ * would last-write-wins on key collision).
+ */
+export const FRONTMATTER_LINK_MAP: FrontmatterFieldMapping[] = [
+  // Person pages → companies
+  { fields: ['company', 'companies'], pageType: 'person', type: 'works_at', direction: 'outgoing', dirHint: 'companies' },
+  { fields: ['founded'], pageType: 'person', type: 'founded', direction: 'outgoing', dirHint: 'companies' },
+  // Company pages (incoming relationships — subject of the verb lives elsewhere)
+  { fields: ['key_people'], pageType: 'company', type: 'works_at', direction: 'incoming', dirHint: 'people' },
+  { fields: ['partner'], pageType: 'company', type: 'yc_partner', direction: 'incoming', dirHint: 'people' },
+  { fields: ['investors'], pageType: 'company', type: 'invested_in', direction: 'incoming',
+    dirHint: ['companies', 'funds', 'people'] },
+  // Deal pages (all incoming — deals are the object)
+  { fields: ['investors'], pageType: 'deal', type: 'invested_in', direction: 'incoming',
+    dirHint: ['companies', 'funds', 'people'] },
+  { fields: ['lead'], pageType: 'deal', type: 'led_round', direction: 'incoming',
+    dirHint: ['companies', 'funds', 'people'] },
+  // Meeting pages
+  { fields: ['attendees'], pageType: 'meeting', type: 'attended', direction: 'incoming', dirHint: 'people' },
+  // Any page type
+  { fields: ['sources'], type: 'discussed_in', direction: 'incoming', dirHint: ['source', 'media'] },
+  { fields: ['source'], type: 'source', direction: 'outgoing', dirHint: '' /* already slug-shaped */ },
+  { fields: ['related', 'see_also'], type: 'related_to', direction: 'outgoing', dirHint: '' },
+];
+
+// ─── Slug resolver ──────────────────────────────────────────────
+
+export interface SlugResolver {
+  /**
+   * Resolve a display name to a canonical slug.
+   * Returns null when no match meets confidence threshold — callers should
+   * skip (not write a dead link) and the unresolved name goes into the
+   * extract/put_page summary so the user can see the gap.
+   */
+  resolve(name: string, dirHint?: string | string[]): Promise<string | null>;
+}
+
+/**
+ * Create a resolver scoped to a single extract run or single put_page call.
+ *
+ * mode: 'batch' (migration / gbrain extract) — pg_trgm only, NO search
+ * fallback. On a 46K-page brain this avoids N-thousand OpenAI embedding
+ * calls + Anthropic Haiku expansion calls (see operations-query-hidden-haiku
+ * learning) and keeps the backfill deterministic + under a wall-clock budget.
+ *
+ * mode: 'live' (put_page auto-link) — can afford the (rare, bounded) search
+ * fallback for names that don't fuzzy-match. Still passes expand=false to
+ * dodge Haiku.
+ *
+ * cache: per-resolver instance. Same name → same slug lookup every call.
+ * Callers never need to dedupe names themselves.
+ */
+export function makeResolver(
+  engine: BrainEngine,
+  opts: { mode: 'batch' | 'live' } = { mode: 'live' },
+): SlugResolver {
+  const cache = new Map<string, string | null>();
+
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+
+  return {
+    async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
+      if (!name || typeof name !== 'string') return null;
+      const trimmed = name.trim();
+      if (!trimmed) return null;
+
+      const cacheKey = `${trimmed}\u0000${Array.isArray(dirHint) ? dirHint.join(',') : (dirHint || '')}`;
+      if (cache.has(cacheKey)) return cache.get(cacheKey)!;
+
+      const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
+
+      // Step 1: already a slug? (dir/name shape, lowercase, hyphenated)
+      if (/^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(trimmed)) {
+        const page = await engine.getPage(trimmed);
+        if (page) {
+          cache.set(cacheKey, trimmed);
+          return trimmed;
+        }
+      }
+
+      // Step 2: dir-hint + slugify → exact getPage
+      const slugified = norm(trimmed);
+      for (const hint of hints) {
+        if (!hint) continue;
+        const candidate = `${hint}/${slugified}`;
+        const page = await engine.getPage(candidate);
+        if (page) {
+          cache.set(cacheKey, candidate);
+          return candidate;
+        }
+      }
+
+      // Step 3: pg_trgm fuzzy title match — both modes. Tries each hint in
+      // order; first hint with a ≥0.55 similarity match wins. If no hints,
+      // try the whole pages table.
+      const searchHints = hints.length > 0 ? hints : [undefined];
+      for (const hint of searchHints) {
+        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55);
+        if (match) {
+          cache.set(cacheKey, match.slug);
+          return match.slug;
+        }
+      }
+
+      // Step 4: live-mode ONLY — fall back to hybrid search. expand: false
+      // is MANDATORY (see operations-query-hidden-haiku learning). Batch
+      // mode skips this step entirely to keep migration deterministic.
+      if (opts.mode === 'live') {
+        try {
+          const results = await engine.searchKeyword(trimmed, { limit: 3 });
+          if (results.length > 0 && results[0].score >= 0.8) {
+            // Filter by dir hint if provided.
+            const top = hints.length > 0
+              ? results.find(r => hints.some(h => r.slug.startsWith(`${h}/`)))
+              : results[0];
+            if (top) {
+              cache.set(cacheKey, top.slug);
+              return top.slug;
+            }
+          }
+        } catch { /* search errors are non-fatal; fall through to null */ }
+      }
+
+      // Null = unresolvable. Caller records for the unresolved report.
+      cache.set(cacheKey, null);
+      return null;
+    },
+  };
+}
+
+// ─── Frontmatter extractor ──────────────────────────────────────
+
+export interface UnresolvedFrontmatterRef {
+  /** The frontmatter field name. */
+  field: string;
+  /** The name that did not resolve. */
+  name: string;
+}
+
+export interface FrontmatterExtractResult {
+  candidates: LinkCandidate[];
+  unresolved: UnresolvedFrontmatterRef[];
+}
+
+/**
+ * Extract typed graph edges from YAML frontmatter. Async because the
+ * resolver may need to query the DB for fuzzy matches.
+ *
+ * Arrays of strings: each entry resolved independently.
+ * Arrays of objects: uses the `name` or `slug` property (codex tension 6.3).
+ * Non-string / non-object entries: silently skipped (log-only).
+ */
+export async function extractFrontmatterLinks(
+  slug: string,
+  pageType: PageType,
+  frontmatter: Record<string, unknown>,
+  resolver: SlugResolver,
+): Promise<FrontmatterExtractResult> {
+  const candidates: LinkCandidate[] = [];
+  const unresolved: UnresolvedFrontmatterRef[] = [];
+
+  for (const mapping of FRONTMATTER_LINK_MAP) {
+    if (mapping.pageType && mapping.pageType !== pageType) continue;
+    for (const field of mapping.fields) {
+      const value = frontmatter[field];
+      if (value == null) continue;
+      const entries = Array.isArray(value) ? value : [value];
+
+      for (const entry of entries) {
+        // Extract the name to resolve. Strings pass through; objects use
+        // the `name` / `slug` / `title` field in that preference order.
+        let name: string | null = null;
+        let contextExtra = '';
+        if (typeof entry === 'string') {
+          name = entry;
+        } else if (entry && typeof entry === 'object') {
+          const obj = entry as Record<string, unknown>;
+          const n = obj.name ?? obj.slug ?? obj.title;
+          if (typeof n === 'string') {
+            name = n;
+            // Carry interesting object fields (role, title) into the context.
+            const extras: string[] = [];
+            if (typeof obj.role === 'string') extras.push(obj.role);
+            if (typeof obj.title === 'string' && obj.title !== n) extras.push(obj.title);
+            if (extras.length > 0) contextExtra = ` (${extras.join(', ')})`;
+          }
+        }
+        if (!name) continue;   // skip numbers, nulls, malformed objects
+
+        const resolved = await resolver.resolve(name, mapping.dirHint);
+        if (!resolved) {
+          unresolved.push({ field, name });
+          continue;
+        }
+
+        // Outgoing: page → resolved. Incoming: resolved → page.
+        const fromSlug = mapping.direction === 'outgoing' ? slug : resolved;
+        const toSlug   = mapping.direction === 'outgoing' ? resolved : slug;
+        // Context enrichment (review Finding 7): readable in backlink panels
+        // and search snippets instead of bare `frontmatter.key_people`.
+        const context = `frontmatter.${field}: ${name}${contextExtra}`;
+
+        candidates.push({
+          fromSlug,
+          targetSlug: toSlug,
+          linkType: mapping.type,
+          context,
+          linkSource: 'frontmatter',
+          originSlug: slug,       // the page whose frontmatter created this edge
+          originField: field,
+        });
+      }
+    }
+  }
+
+  return { candidates, unresolved };
+}
+
 // ─── Timeline parsing ───────────────────────────────────────────
 
 export interface TimelineCandidate {
@@ -407,6 +755,19 @@ function isValidDate(s: string): boolean {
  */
 export async function isAutoLinkEnabled(engine: BrainEngine): Promise<boolean> {
   const val = await engine.getConfig('auto_link');
+  if (val == null) return true;
+  const normalized = val.trim().toLowerCase();
+  return !['false', '0', 'no', 'off'].includes(normalized);
+}
+
+/**
+ * Read the auto_timeline config flag. Defaults to TRUE (on by default).
+ * Same truthiness rules as isAutoLinkEnabled. Controls whether put_page
+ * parses timeline entries from freshly-written content and inserts them
+ * via addTimelineEntriesBatch.
+ */
+export async function isAutoTimelineEnabled(engine: BrainEngine): Promise<boolean> {
+  const val = await engine.getConfig('auto_timeline');
   if (val == null) return true;
   const normalized = val.trim().toLowerCase();
   return !['false', '0', 'no', 'off'].includes(normalized);
