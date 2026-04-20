@@ -54,7 +54,8 @@
     "postgres": "^3.4.0"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "pdf-parse": "^2.4.5"
   },
   "license": "MIT"
 }
