@@ -38,12 +38,21 @@ export class PostgresEngine implements BrainEngine {
       const url = config.database_url;
       if (!url) throw new GBrainError('No database URL', 'database_url is missing', 'Provide --url');
       const size = Math.min(config.poolSize, db.resolvePoolSize(config.poolSize));
-      this._sql = postgres(url, {
+      // Honor PgBouncer transaction-mode detection on worker-instance pools too.
+      // Without this, `gbrain jobs work` against a Supabase pooler URL hits
+      // "prepared statement does not exist" under load just like the module
+      // singleton did before v0.15.4.
+      const prepare = db.resolvePrepare(url);
+      const opts: Record<string, unknown> = {
         max: size,
         idle_timeout: 20,
         connect_timeout: 10,
         types: { bigint: postgres.BigInt },
-      });
+      };
+      if (typeof prepare === 'boolean') {
+        opts.prepare = prepare;
+      }
+      this._sql = postgres(url, opts);
       await this._sql`SELECT 1`;
     } else {
       // Module-level singleton (backward compat for CLI main engine)
