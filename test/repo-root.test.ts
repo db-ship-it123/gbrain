@@ -45,10 +45,9 @@ describe('findRepoRoot', () => {
   });
 
   it('default arg uses process.cwd() (behavioral parity with prior doctor-private impl)', () => {
-    // This test runs from inside the gbrain repo, so the cwd walk should
-    // find the real skills/RESOLVER.md. Verify the default kicks in.
-    const result = findRepoRoot();
-    expect(result).not.toBeNull();
-    expect(result).toMatch(/honolulu/);
+    // The default arg must match calling with an explicit process.cwd().
+    // Don't assert on the path contents — it varies between local checkouts
+    // and CI runners. What matters is parity: no-arg === cwd-arg.
+    expect(findRepoRoot()).toBe(findRepoRoot(process.cwd()));
   });
 });
