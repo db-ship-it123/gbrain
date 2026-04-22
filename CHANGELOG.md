@@ -111,7 +111,99 @@ Credit: @Wintermute for the original `gbrain dream` thesis (PR #309). The brand-
 - `Co-Authored-By: Wintermute` preserved on commit 5 (the dream.ts rewrite).
 
 ---
+## [0.16.2] - 2026-04-22
 
+## **The deployment guide now reads like a runbook an agent can execute line-by-line.**
+## **Three real bugs from v0.16.1 fixed, nine DX gaps closed.**
+
+v0.16.1 shipped the Minions worker deployment guide. Re-reading it as the agent it was written for, top-to-bottom, copy-pasting every block, surfaced twelve issues a human skim-reader would not catch. Three are real bugs that break a first-time deploy. Nine are structural gaps that force the agent to invent values.
+
+The bugs: the crontab example used `*/5 * * * * user bash /path/...` which is `/etc/crontab` format only, so an agent running `crontab -e` and pasting it got "bad minute" or parsed `user` as the command. The watchdog script grepped `tail -20` of an unrotated log for shutdown markers, so every 5-minute tick after the first restart re-matched the old shutdown line forever and killed the healthy worker on loop. And `DATABASE_URL=postgresql://user:pass@...` lived directly in `/etc/crontab`, which is mode 644 (world-readable).
+
+The gaps: no preconditions block, no "which option should I pick" selector, hardcoded `/path/to/...` and `/my/workspace` throughout with no template-variable legend, no upgrade section (so an agent coming from v0.13.x had no idea `GBRAIN_ALLOW_SHELL_JOBS=1` is now required or that `max_stalled` flipped from 1 to 5), no alternative to bare cron for Fly/Render/systemd deployments, a "Proposed CLI flags (not yet implemented)" block that an agent would copy and get `unrecognized flag`, and a `MinionWorker.maxStalledCount` note that did not tell the agent what to do.
+
+### What this means for operators
+
+The guide is now copy-pasteable without invention. Every `$VAR` is documented in a table at the top. Every code block runs as-is on the target it claims. The watchdog writes a two-line PID file (PID + restart epoch) and the shutdown check only considers log lines newer than the epoch, which is the actual fix for the restart loop. Secrets live in `/etc/gbrain.env` (mode 600), referenced via `BASH_ENV=/etc/gbrain.env` in crontab. A new Option 3 ships a systemd unit, a Procfile, and a fly.toml fragment so Fly/Render/Railway/systemd users skip cron entirely. The upgrade section walks the v0.13.x → v0.16.2 checklist (stop worker, apply migrations, add `GBRAIN_ALLOW_SHELL_JOBS`, swap the watchdog).
+
+The shipped watchdog was verified against an abbreviated end-to-end test (3 ticks in ~30 seconds inside an Ubuntu 22.04 container): tick 1 starts the worker and writes the 2-line PID file; tick 2 sees a shutdown line with a 1-hour-old timestamp and correctly does nothing; tick 3 sees a fresh shutdown line and correctly restarts. The regex was caught and fixed during the test when mawk rejected `{n}` interval quantifiers. The systemd unit was smoked in a privileged container with `Restart=always` firing a second banner after a 10-second `RestartSec` window, confirming crash-recovery works before any host ever boots the unit.
+
+## To take advantage of v0.16.2
+
+`gbrain upgrade` pulls the new guide. If you deployed under v0.16.1 with the original watchdog, swap it:
+
+1. **Re-read the guide:**
+   ```bash
+   less docs/guides/minions-deployment.md
+   ```
+2. **Swap the watchdog script.** The v0.16.1 version has the restart-loop bug:
+   ```bash
+   sudo install -m 755 docs/guides/minions-deployment-snippets/minion-watchdog.sh \
+     /usr/local/bin/minion-watchdog.sh
+   ```
+3. **Move secrets out of crontab.** Put `DATABASE_URL` and `GBRAIN_ALLOW_SHELL_JOBS=1` into `/etc/gbrain.env` (mode 600), reference it from crontab via `BASH_ENV=/etc/gbrain.env`.
+4. **Fix the cron form.** If you pasted the v0.16.1 `*/5 * * * * user bash ...` into `crontab -e`, drop the `user` column and the explicit `bash` prefix.
+5. **If you have shell access to a long-running box,** consider Option 3 (systemd) instead of Option 1 (watchdog). systemd replaces the watchdog entirely and is the cleanest path.
+
+No schema change. No data migration. Docs + snippets only.
+
+### Itemized changes
+
+**Fixed**
+- **Crontab syntax now matches the target.** Two labeled blocks: 5-field for `crontab -e`, 6-field with user column for `/etc/crontab`. An agent no longer hits "bad minute" or has `user` parsed as the command.
+- **Watchdog restart loop killed.** The shipped `minion-watchdog.sh` writes a two-line PID file (PID on line 1, restart epoch on line 2) and only considers log lines whose ISO-8601 timestamp is newer than the epoch. Stale shutdown lines from earlier restarts no longer re-match every 5 minutes forever. Regex rewritten to use explicit `[0-9][0-9][0-9][0-9]` instead of `{4}` intervals because mawk (Debian/Ubuntu's default awk) rejects interval quantifiers. Verified end-to-end in a 3-tick abbreviated test inside Ubuntu 22.04.
+- **Credentials off the world-readable filesystem.** Secrets move to `/etc/gbrain.env` (mode 600, owned by the worker user), referenced via `BASH_ENV=/etc/gbrain.env` in crontab. `/etc/crontab` is mode 644 and user crontabs under `/var/spool/cron/` are readable by root. A new `gbrain.env.example` ships in-repo with the full env surface.
+
+**Added**
+- **Preconditions block.** Five checks at the top of the guide: `gbrain` on PATH, DB connectivity, schema version, crontab write access, and the `GBRAIN_ALLOW_SHELL_JOBS=1` requirement for shell-job workers. Agent fails fast on setup, not content.
+- **Decision tree.** "Which option?" selector at the top of the deployment section. Subagent workloads and long jobs take Option 1. Scheduled scripts take Option 2. No shell access take Option 3. Replaces the previous "recommended for X" prose that forced re-reading.
+- **Template variable table.** Six variables (`$GBRAIN_BIN`, `$GBRAIN_WORKER_USER`, `$GBRAIN_WORKER_PID_FILE`, `$GBRAIN_WORKER_LOG_FILE`, `$GBRAIN_WORKSPACE`, `$GBRAIN_ENV_FILE`) with meaning and typical value. Agent substitutes once, everything downstream lands correctly.
+- **Upgrade section.** v0.13.x → v0.16.2 checklist: stop the worker, run migrations, add `GBRAIN_ALLOW_SHELL_JOBS=1` for shell jobs, handle the `max_stalled` default flip from 1 to 5, swap the v0.16.1 watchdog for the current one.
+- **Option 3: service manager.** New `systemd.service`, `Procfile`, and `fly.toml.partial` ship under `docs/guides/minions-deployment-snippets/`. systemd replaces the watchdog entirely with `Restart=always` + `RestartSec=10s` and runs the worker as an unprivileged user with `PrivateTmp`, `ProtectSystem=strict`, and `ReadWritePaths`. Smoked end-to-end in a privileged container: banner fired twice across a 10-second restart cycle, `Restart=always` honored, unit enabled for boot persistence.
+- **Uninstall section.** One-paragraph rollback for each option.
+- **`docs/guides/minions-deployment.md` listed in `scripts/llms-config.ts`.** Remote agents fetching `llms.txt` or `llms-full.txt` now see the deployment guide without having to guess its path.
+
+**Changed**
+- **`--follow` example uses a gbrain subcommand, not `node my-script.mjs`.** The new example submits `gbrain embed --stale` as a shell job on a dedicated queue with `--timeout-ms 600000`. Maps directly onto how an OpenClaw-style agent actually schedules brain maintenance.
+- **"Proposed CLI flags (not yet implemented)" dead-end removed.** Replaced with a "Tune per-job today" callout pointing at the `gbrain jobs submit` flags that exist in source (`--max-stalled`, `--backoff-type`, `--backoff-delay`, `--backoff-jitter`, `--timeout-ms`, `--idempotency-key` — all first-class since v0.13.1).
+- **Known Issues rewritten as imperatives.** "DO NOT pass `maxStalledCount` to `MinionWorker`" leads the paragraph, followed by the reason and the correct knob (`gbrain jobs submit --max-stalled N`). Zombie-shell-children section leads with the 10s / 30s numbers and the action.
+
+Contributed by garrytan (issue report), fixes verified by an abbreviated end-to-end test suite (render-check + watchdog 3-tick + systemd container smoke + `bun test` + full E2E DB lifecycle).
+
+## [0.16.1] - 2026-04-22
+
+## **Minions worker deployment, finally documented.**
+## **If you run `gbrain jobs work` in production, there's now a guide for the sharp edges.**
+
+Garry's OpenClaw (gbrain's own instance, out there actually running `gbrain jobs work` in production) wrote a real deployment guide for the Minions worker, the piece of gbrain most operators hit next after getting sync running. Agents dogfooding the project they live on is a weird, good feedback loop. Two patterns: a watchdog cron for persistent workers, and an inline `--follow` for cron-only workloads. It covers the connection-drop, stall-detector, and zombie-child traps that show up once your brain is actually working for you. Every command and every default in the guide is checked against current source (`max_stalled = 5`, not 1 or 3; `--follow` exits on submitted-job-terminal, not queue-empty; stalled jobs show up as `active`, not `waiting`). Nothing about this was obvious, and nothing about it was in the docs before.
+
+With v0.16.0's durable agent runtime now shipping, the persistent worker is load-bearing for a lot more (`subagent` + `subagent_aggregator` handlers run there too). A supervised deployment story is the sharp end of the stick.
+
+### What this means for operators
+
+If you have been running the Minions worker under `nohup` with no restart story, this guide is the missing manual. Copy the watchdog script, paste the crontab env lines (`SHELL=/bin/bash`, `PATH`, `DATABASE_URL`, `GBRAIN_ALLOW_SHELL_JOBS=1`), and wire the cron to run every 5 minutes. You get a restart loop that handles the three silent-death modes: DB connection blip, lock-renewal stall, event loop wedge.
+
+If you are running scheduled shell jobs only, skip the persistent worker and use `--follow`. 2-3 seconds of startup overhead is trivial when your job runs for a minute.
+
+Docs-only release. No code changed. Zero migration required.
+
+## To take advantage of v0.16.1
+
+`gbrain upgrade` pulls the new guide. Read it:
+
+1. **Open the guide:**
+   ```bash
+   less docs/guides/minions-deployment.md
+   ```
+   Or browse it on GitHub.
+2. **Persistent worker:** copy `minion-watchdog.sh`, set crontab env lines, wire a `*/5 * * * *` cron.
+3. **Scheduled shell jobs only:** rewrite your cron as `gbrain jobs submit shell ... --follow --timeout-ms N` and drop the persistent worker entirely.
+4. **The "Proposed CLI flags" section** (`--lock-duration` / `--max-stalled` / `--stall-interval` on `gbrain jobs work`): those are on the roadmap. Per-job `--max-stalled` on `gbrain jobs submit` is already real and writes to the row's column directly.
+
+### Itemized changes
+
+**Added**
+- **Minions worker deployment guide** — new `docs/guides/minions-deployment.md` covering watchdog cron patterns, inline `--follow` for cron-only workloads, and the sharp edges of running `gbrain jobs work` against Supabase in production. Addresses a real gap: existing Minions docs (`minions-fix.md`, `minions-shell-jobs.md`) cover schema repair and shell-job security, not deploy patterns. Contributed by your OpenClaw via #287. Pre-landing accuracy pass corrected five factual bugs against current source: the `max_stalled` column default (5, not 1 or 3), the stalled-jobs smoke-test query (`active`, not `waiting`), the SIGTERM-to-SIGKILL grace window (10s minimum, not 2s), the cron env pattern (crontab env lines, not `source ~/.bashrc`), and the `--follow` exit semantics (blocks until submitted job is terminal, not until queue is empty).
 ## [0.16.0] - 2026-04-20
 
 ## **Durable agents land. Your LLM loops survive crashes, timeouts, and worker restarts now.**
