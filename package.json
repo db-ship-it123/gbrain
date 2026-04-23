@@ -1,6 +1,6 @@
 {
   "name": "gbrain",
-  "version": "0.10.1",
+  "version": "0.16.4",
   "description": "Postgres-native personal knowledge brain with hybrid RAG search",
   "type": "module",
   "main": "src/core/index.ts",
@@ -11,7 +11,9 @@
     ".": "./src/core/index.ts",
     "./engine": "./src/core/engine.ts",
     "./types": "./src/core/types.ts",
-    "./operations": "./src/core/operations.ts"
+    "./operations": "./src/core/operations.ts",
+    "./minions": "./src/core/minions/index.ts",
+    "./engine-factory": "./src/core/engine-factory.ts"
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
@@ -19,8 +21,13 @@
     "build:all": "bun build --compile --target=bun-darwin-arm64 --outfile bin/gbrain-darwin-arm64 src/cli.ts && bun build --compile --target=bun-linux-x64 --outfile bin/gbrain-linux-x64 src/cli.ts",
     "build:admin": "cd admin && bun run build",
     "build:schema": "bash scripts/build-schema.sh",
-    "test": "bun test",
-    "test:e2e": "bun test test/e2e/",
+    "build:llms": "bun run scripts/build-llms.ts",
+    "test": "scripts/check-jsonb-pattern.sh && scripts/check-progress-to-stdout.sh && bun run typecheck && bun test",
+    "test:e2e": "bash scripts/run-e2e.sh",
+    "typecheck": "tsc --noEmit",
+    "check:jsonb": "scripts/check-jsonb-pattern.sh",
+    "check:progress": "scripts/check-progress-to-stdout.sh",
+    "postinstall": "command -v gbrain >/dev/null 2>&1 && gbrain apply-migrations --yes --non-interactive || echo '[gbrain] postinstall skipped. If installed via bun install -g github:...: run `gbrain doctor` and `gbrain apply-migrations --yes` manually. See https://github.com/garrytan/gbrain/issues/218' 1>&2",
     "prepublish:clawhub": "bun run build:all",
     "publish:clawhub": "clawhub package publish . --family bundle-plugin"
   },
@@ -32,7 +39,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.30.0",
     "@aws-sdk/client-s3": "^3.1028.0",
-    "@electric-sql/pglite": "^0.4.4",
+    "@electric-sql/pglite": "0.4.3",
     "@modelcontextprotocol/sdk": "1.29.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
@@ -44,7 +51,13 @@
     "postgres": "^3.4.0"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "typescript": "^5.6.0"
   },
+  "trustedDependencies": [
+    "@electric-sql/pglite"
+  ],
   "license": "MIT"
 }

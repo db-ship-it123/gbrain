@@ -6,6 +6,7 @@ import { operations, OperationError } from '../core/operations.ts';
 import type { Operation, OperationContext } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
 import { VERSION } from '../version.ts';
+import { buildToolDefs } from './tool-defs.ts';
 
 /** Validate required params exist and have the expected type */
 function validateParams(op: Operation, params: Record<string, unknown>): string | null {
@@ -32,26 +33,11 @@ export async function startMcpServer(engine: BrainEngine) {
     { capabilities: { tools: {} } },
   );
 
-  // Generate tool definitions from operations
+  // Generate tool definitions from operations. Extracted to buildToolDefs so
+  // the subagent tool registry (v0.15+) can call the same mapper against a
+  // filtered OPERATIONS subset instead of duplicating this shape.
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: operations.map(op => ({
-      name: op.name,
-      description: op.description,
-      inputSchema: {
-        type: 'object' as const,
-        properties: Object.fromEntries(
-          Object.entries(op.params).map(([k, v]) => [k, {
-            type: v.type === 'array' ? 'array' : v.type,
-            ...(v.description ? { description: v.description } : {}),
-            ...(v.enum ? { enum: v.enum } : {}),
-            ...(v.items ? { items: { type: v.items.type } } : {}),
-          }]),
-        ),
-        required: Object.entries(op.params)
-          .filter(([, v]) => v.required)
-          .map(([k]) => k),
-      },
-    })),
+    tools: buildToolDefs(operations),
   }));
 
   // Dispatch tool calls to operation handlers
@@ -71,6 +57,8 @@ export async function startMcpServer(engine: BrainEngine) {
         error: (msg: string) => process.stderr.write(`[error] ${msg}\n`),
       },
       dryRun: !!(params?.dry_run),
+      // MCP stdio callers are remote/untrusted; enforce strict file confinement.
+      remote: true,
     };
 
     const safeParams = params || {};
@@ -112,6 +100,8 @@ export async function handleToolCall(
     config: loadConfig() || { engine: 'postgres' },
     logger: { info: console.log, warn: console.warn, error: console.error },
     dryRun: !!(params?.dry_run),
+    // Backing path for `gbrain call` CLI command — trusted local invocation.
+    remote: false,
   };
 
   return op.handler(ctx, params);

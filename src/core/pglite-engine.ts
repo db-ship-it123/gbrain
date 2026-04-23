@@ -2,7 +2,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite/vector';
 import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm';
 import type { Transaction } from '@electric-sql/pglite';
-import type { BrainEngine } from './engine.ts';
+import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { runMigrations } from './migrate.ts';
 import { PGLITE_SCHEMA_SQL } from './pglite-schema.ts';
@@ -11,7 +11,7 @@ import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput,
   SearchResult, SearchOpts,
-  Link, GraphNode,
+  Link, GraphNode, GraphPath,
   TimelineEntry, TimelineInput, TimelineOpts,
   RawData,
   PageVersion,
@@ -24,6 +24,7 @@ import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult } f
 type PGLiteDB = PGlite;
 
 export class PGLiteEngine implements BrainEngine {
+  readonly kind = 'pglite' as const;
   private _db: PGLiteDB | null = null;
   private _lock: LockHandle | null = null;
 
@@ -43,10 +44,32 @@ export class PGLiteEngine implements BrainEngine {
       throw new Error('Could not acquire PGLite lock. Another gbrain process is using the database.');
     }
 
-    this._db = await PGlite.create({
-      dataDir,
-      extensions: { vector, pg_trgm },
-    });
+    try {
+      this._db = await PGlite.create({
+        dataDir,
+        extensions: { vector, pg_trgm },
+      });
+    } catch (err) {
+      // v0.13.1: any PGLite.create() failure becomes actionable. Most commonly
+      // this is the macOS 26.3 WASM bug (#223). We deliberately do NOT suggest
+      // "missing migrations" as a cause — migrations run AFTER create(), so a
+      // create-time abort has nothing to do with them. Nest the original error
+      // message so debugging isn't erased.
+      const original = err instanceof Error ? err.message : String(err);
+      const wrapped = new Error(
+        `PGLite failed to initialize its WASM runtime.\n` +
+        `  This is most commonly the macOS 26.3 WASM bug: https://github.com/garrytan/gbrain/issues/223\n` +
+        `  Run \`gbrain doctor\` for a full diagnosis.\n` +
+        `  Original error: ${original}`
+      );
+      // Release the lock so a fresh process can try again; leaking the lock
+      // here turns a recoverable init error into a stuck-brain state.
+      if (this._lock?.acquired) {
+        try { await releaseLock(this._lock); } catch { /* ignore cleanup error */ }
+        this._lock = null;
+      }
+      throw wrapped;
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -90,13 +113,18 @@ export class PGLiteEngine implements BrainEngine {
 
   async putPage(slug: string, page: PageInput): Promise<Page> {
     slug = validateSlug(slug);
-    const hash = page.content_hash || contentHash(page.compiled_truth, page.timeline || '');
+    const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
 
+    // v0.18.0 Step 2: source_id relies on the schema DEFAULT 'default' so
+    // existing callers still target the default source without threading
+    // a parameter. ON CONFLICT target becomes (source_id, slug) since the
+    // global UNIQUE(slug) was dropped in migration v17. Step 5+ will
+    // surface an explicit sourceId param on putPage for multi-source sync.
     const { rows } = await this.db.query(
       `INSERT INTO pages (slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, now())
-       ON CONFLICT (slug) DO UPDATE SET
+       ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          title = EXCLUDED.title,
          compiled_truth = EXCLUDED.compiled_truth,
@@ -118,38 +146,39 @@ export class PGLiteEngine implements BrainEngine {
     const limit = filters?.limit || 100;
     const offset = filters?.offset || 0;
 
-    let result;
-    if (filters?.type && filters?.tag) {
-      result = await this.db.query(
-        `SELECT p.* FROM pages p
-         JOIN tags t ON t.page_id = p.id
-         WHERE p.type = $1 AND t.tag = $2
-         ORDER BY p.updated_at DESC LIMIT $3 OFFSET $4`,
-        [filters.type, filters.tag, limit, offset]
-      );
-    } else if (filters?.type) {
-      result = await this.db.query(
-        `SELECT * FROM pages WHERE type = $1
-         ORDER BY updated_at DESC LIMIT $2 OFFSET $3`,
-        [filters.type, limit, offset]
-      );
-    } else if (filters?.tag) {
-      result = await this.db.query(
-        `SELECT p.* FROM pages p
-         JOIN tags t ON t.page_id = p.id
-         WHERE t.tag = $1
-         ORDER BY p.updated_at DESC LIMIT $2 OFFSET $3`,
-        [filters.tag, limit, offset]
-      );
-    } else {
-      result = await this.db.query(
-        `SELECT * FROM pages
-         ORDER BY updated_at DESC LIMIT $1 OFFSET $2`,
-        [limit, offset]
-      );
+    const where: string[] = [];
+    const params: unknown[] = [];
+    const tagJoin = filters?.tag ? 'JOIN tags t ON t.page_id = p.id' : '';
+
+    if (filters?.type) {
+      params.push(filters.type);
+      where.push(`p.type = $${params.length}`);
+    }
+    if (filters?.tag) {
+      params.push(filters.tag);
+      where.push(`t.tag = $${params.length}`);
+    }
+    if (filters?.updated_after) {
+      params.push(filters.updated_after);
+      where.push(`p.updated_at > $${params.length}::timestamptz`);
     }
 
-    return (result.rows as Record<string, unknown>[]).map(rowToPage);
+    const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+    params.push(limit, offset);
+    const limitSql = `LIMIT $${params.length - 1} OFFSET $${params.length}`;
+
+    const { rows } = await this.db.query(
+      `SELECT p.* FROM pages p ${tagJoin} ${whereSql}
+       ORDER BY p.updated_at DESC ${limitSql}`,
+      params
+    );
+
+    return (rows as Record<string, unknown>[]).map(rowToPage);
+  }
+
+  async getAllSlugs(): Promise<Set<string>> {
+    const { rows } = await this.db.query('SELECT slug FROM pages');
+    return new Set((rows as { slug: string }[]).map(r => r.slug));
   }
 
   async resolveSlugs(partial: string): Promise<string[]> {
@@ -181,7 +210,7 @@ export class PGLiteEngine implements BrainEngine {
 
     const { rows } = await this.db.query(
       `SELECT
-        p.slug, p.id as page_id, p.title, p.type,
+        p.slug, p.id as page_id, p.title, p.type, p.source_id,
         cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
         ts_rank(p.search_vector, websearch_to_tsquery('english', $1)) AS score,
         CASE WHEN p.updated_at < (
@@ -211,7 +240,7 @@ export class PGLiteEngine implements BrainEngine {
 
     const { rows } = await this.db.query(
       `SELECT
-        p.slug, p.id as page_id, p.title, p.type,
+        p.slug, p.id as page_id, p.title, p.type, p.source_id,
         cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
         1 - (cc.embedding <=> $1::vector) AS score,
         CASE WHEN p.updated_at < (
@@ -320,34 +349,110 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Links
-  async addLink(from: string, to: string, context?: string, linkType?: string): Promise<void> {
+  async addLink(
+    from: string,
+    to: string,
+    context?: string,
+    linkType?: string,
+    linkSource?: string,
+    originSlug?: string,
+    originField?: string,
+  ): Promise<void> {
+    const src = linkSource ?? 'markdown';
     await this.db.query(
-      `INSERT INTO links (from_page_id, to_page_id, link_type, context)
-       SELECT f.id, t.id, $3, $4
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
+       SELECT f.id, t.id, $3, $4, $5,
+              (SELECT id FROM pages WHERE slug = $6),
+              $7
        FROM pages f, pages t
        WHERE f.slug = $1 AND t.slug = $2
-       ON CONFLICT (from_page_id, to_page_id) DO UPDATE SET
-         link_type = EXCLUDED.link_type,
-         context = EXCLUDED.context`,
-      [from, to, linkType || '', context || '']
+       ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO UPDATE SET
+         context = EXCLUDED.context,
+         origin_field = EXCLUDED.origin_field`,
+      [from, to, linkType || '', context || '', src, originSlug ?? null, originField ?? null]
     );
   }
 
-  async removeLink(from: string, to: string): Promise<void> {
-    await this.db.query(
-      `DELETE FROM links
-       WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1)
-         AND to_page_id = (SELECT id FROM pages WHERE slug = $2)`,
-      [from, to]
+  async addLinksBatch(links: LinkBatchInput[]): Promise<number> {
+    if (links.length === 0) return 0;
+    // unnest() pattern: 10 array-typed bound parameters regardless of batch
+    // size. Same shape as PostgresEngine (v0.18). Avoids the 65535-parameter
+    // cap.
+    //
+    // v0.18.0: every JOIN composite-keys on (slug, source_id) so the batch
+    // can't fan out across sources when the same slug exists in multiple
+    // sources. Origin JOIN uses LEFT JOIN on a composite key — NULL
+    // origin_slug leaves origin_page_id NULL, same as pre-v0.18.
+    const fromSlugs = links.map(l => l.from_slug);
+    const toSlugs = links.map(l => l.to_slug);
+    const linkTypes = links.map(l => l.link_type || '');
+    const contexts = links.map(l => l.context || '');
+    const linkSources = links.map(l => l.link_source || 'markdown');
+    const originSlugs = links.map(l => l.origin_slug || null);
+    const originFields = links.map(l => l.origin_field || null);
+    const fromSourceIds = links.map(l => l.from_source_id || 'default');
+    const toSourceIds = links.map(l => l.to_source_id || 'default');
+    const originSourceIds = links.map(l => l.origin_source_id || 'default');
+    const result = await this.db.query(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source, origin_page_id, origin_field)
+       SELECT f.id, t.id, v.link_type, v.context, v.link_source, o.id, v.origin_field
+       FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[])
+         AS v(from_slug, to_slug, link_type, context, link_source, origin_slug, origin_field, from_source_id, to_source_id, origin_source_id)
+       JOIN pages f ON f.slug = v.from_slug AND f.source_id = v.from_source_id
+       JOIN pages t ON t.slug = v.to_slug AND t.source_id = v.to_source_id
+       LEFT JOIN pages o ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
+       ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO NOTHING
+       RETURNING 1`,
+      [fromSlugs, toSlugs, linkTypes, contexts, linkSources, originSlugs, originFields, fromSourceIds, toSourceIds, originSourceIds]
     );
+    return result.rows.length;
+  }
+
+  async removeLink(from: string, to: string, linkType?: string, linkSource?: string): Promise<void> {
+    if (linkType !== undefined && linkSource !== undefined) {
+      await this.db.query(
+        `DELETE FROM links
+         WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1)
+           AND to_page_id = (SELECT id FROM pages WHERE slug = $2)
+           AND link_type = $3
+           AND link_source IS NOT DISTINCT FROM $4`,
+        [from, to, linkType, linkSource]
+      );
+    } else if (linkType !== undefined) {
+      await this.db.query(
+        `DELETE FROM links
+         WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1)
+           AND to_page_id = (SELECT id FROM pages WHERE slug = $2)
+           AND link_type = $3`,
+        [from, to, linkType]
+      );
+    } else if (linkSource !== undefined) {
+      await this.db.query(
+        `DELETE FROM links
+         WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1)
+           AND to_page_id = (SELECT id FROM pages WHERE slug = $2)
+           AND link_source IS NOT DISTINCT FROM $3`,
+        [from, to, linkSource]
+      );
+    } else {
+      await this.db.query(
+        `DELETE FROM links
+         WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1)
+           AND to_page_id = (SELECT id FROM pages WHERE slug = $2)`,
+        [from, to]
+      );
+    }
   }
 
   async getLinks(slug: string): Promise<Link[]> {
     const { rows } = await this.db.query(
-      `SELECT f.slug as from_slug, t.slug as to_slug, l.link_type, l.context
+      `SELECT f.slug as from_slug, t.slug as to_slug,
+              l.link_type, l.context, l.link_source,
+              o.slug as origin_slug, l.origin_field
        FROM links l
        JOIN pages f ON f.id = l.from_page_id
        JOIN pages t ON t.id = l.to_page_id
+       LEFT JOIN pages o ON o.id = l.origin_page_id
        WHERE f.slug = $1`,
       [slug]
     );
@@ -356,33 +461,69 @@ export class PGLiteEngine implements BrainEngine {
 
   async getBacklinks(slug: string): Promise<Link[]> {
     const { rows } = await this.db.query(
-      `SELECT f.slug as from_slug, t.slug as to_slug, l.link_type, l.context
+      `SELECT f.slug as from_slug, t.slug as to_slug,
+              l.link_type, l.context, l.link_source,
+              o.slug as origin_slug, l.origin_field
        FROM links l
        JOIN pages f ON f.id = l.from_page_id
        JOIN pages t ON t.id = l.to_page_id
+       LEFT JOIN pages o ON o.id = l.origin_page_id
        WHERE t.slug = $1`,
       [slug]
     );
     return rows as unknown as Link[];
   }
 
+  async findByTitleFuzzy(
+    name: string,
+    dirPrefix?: string,
+    minSimilarity: number = 0.55,
+  ): Promise<{ slug: string; similarity: number } | null> {
+    // Inline threshold comparison instead of `SET LOCAL pg_trgm.similarity_threshold`.
+    // The GUC only scopes to the current transaction and pglite auto-commits each
+    // .query() call, so the SET LOCAL would be a no-op. Using similarity() >= $N
+    // directly gives predictable behavior. Tie-breaker: sort by slug so re-runs
+    // pick the same winner.
+    const prefixPattern = dirPrefix ? `${dirPrefix}/%` : '%';
+    const { rows } = await this.db.query(
+      `SELECT slug, similarity(title, $1) AS sim
+       FROM pages
+       WHERE similarity(title, $1) >= $3
+         AND slug LIKE $2
+       ORDER BY sim DESC, slug ASC
+       LIMIT 1`,
+      [name, prefixPattern, minSimilarity]
+    );
+    if (rows.length === 0) return null;
+    const row = rows[0] as { slug: string; sim: number };
+    return { slug: row.slug, similarity: row.sim };
+  }
+
   async traverseGraph(slug: string, depth: number = 5): Promise<GraphNode[]> {
+    // Cycle prevention: visited array tracks page IDs already in the path.
+    // Prevents exponential blowup on cyclic subgraphs (e.g., A->B->A).
     const { rows } = await this.db.query(
       `WITH RECURSIVE graph AS (
-        SELECT p.id, p.slug, p.title, p.type, 0 as depth
+        SELECT p.id, p.slug, p.title, p.type, 0 as depth, ARRAY[p.id] as visited
         FROM pages p WHERE p.slug = $1
 
-        UNION
+        UNION ALL
 
-        SELECT p2.id, p2.slug, p2.title, p2.type, g.depth + 1
+        SELECT p2.id, p2.slug, p2.title, p2.type, g.depth + 1, g.visited || p2.id
         FROM graph g
         JOIN links l ON l.from_page_id = g.id
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE g.depth < $2
+          AND NOT (p2.id = ANY(g.visited))
       )
       SELECT DISTINCT g.slug, g.title, g.type, g.depth,
         coalesce(
-          (SELECT jsonb_agg(jsonb_build_object('to_slug', p3.slug, 'link_type', l2.link_type))
+          -- jsonb_agg(DISTINCT ...) collapses duplicate (to_slug, link_type)
+          -- edges that originate from different provenance (markdown body
+          -- vs frontmatter vs auto-extracted). Presentation-only dedup;
+          -- the links table still preserves every provenance row. See
+          -- plan Bug 6/10.
+          (SELECT jsonb_agg(DISTINCT jsonb_build_object('to_slug', p3.slug, 'link_type', l2.link_type))
            FROM links l2
            JOIN pages p3 ON p3.id = l2.to_page_id
            WHERE l2.from_page_id = g.id),
@@ -400,6 +541,147 @@ export class PGLiteEngine implements BrainEngine {
       depth: r.depth as number,
       links: (typeof r.links === 'string' ? JSON.parse(r.links) : r.links) as { to_slug: string; link_type: string }[],
     }));
+  }
+
+  async traversePaths(
+    slug: string,
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
+  ): Promise<GraphPath[]> {
+    const depth = opts?.depth ?? 5;
+    const direction = opts?.direction ?? 'out';
+    const linkType = opts?.linkType ?? null;
+    const linkTypeWhere = linkType !== null ? 'AND l.link_type = $3' : '';
+    const params: unknown[] = [slug, depth];
+    if (linkType !== null) params.push(linkType);
+
+    let sql: string;
+    if (direction === 'out') {
+      sql = `
+        WITH RECURSIVE walk AS (
+          SELECT p.id, p.slug, 0::int AS depth, ARRAY[p.id] AS visited
+          FROM pages p WHERE p.slug = $1
+          UNION ALL
+          SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
+          FROM walk w
+          JOIN links l ON l.from_page_id = w.id
+          JOIN pages p2 ON p2.id = l.to_page_id
+          WHERE w.depth < $2
+            AND NOT (p2.id = ANY(w.visited))
+            ${linkTypeWhere}
+        )
+        SELECT w.slug AS from_slug, p2.slug AS to_slug,
+               l.link_type, l.context, w.depth + 1 AS depth
+        FROM walk w
+        JOIN links l ON l.from_page_id = w.id
+        JOIN pages p2 ON p2.id = l.to_page_id
+        WHERE w.depth < $2
+          ${linkTypeWhere}
+        ORDER BY depth, from_slug, to_slug
+      `;
+    } else if (direction === 'in') {
+      sql = `
+        WITH RECURSIVE walk AS (
+          SELECT p.id, p.slug, 0::int AS depth, ARRAY[p.id] AS visited
+          FROM pages p WHERE p.slug = $1
+          UNION ALL
+          SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
+          FROM walk w
+          JOIN links l ON l.to_page_id = w.id
+          JOIN pages p2 ON p2.id = l.from_page_id
+          WHERE w.depth < $2
+            AND NOT (p2.id = ANY(w.visited))
+            ${linkTypeWhere}
+        )
+        SELECT p2.slug AS from_slug, w.slug AS to_slug,
+               l.link_type, l.context, w.depth + 1 AS depth
+        FROM walk w
+        JOIN links l ON l.to_page_id = w.id
+        JOIN pages p2 ON p2.id = l.from_page_id
+        WHERE w.depth < $2
+          ${linkTypeWhere}
+        ORDER BY depth, from_slug, to_slug
+      `;
+    } else {
+      // both: walk in both directions, emit every traversed edge (preserving its
+      // natural from->to direction from the links table).
+      sql = `
+        WITH RECURSIVE walk AS (
+          SELECT p.id, 0::int AS depth, ARRAY[p.id] AS visited
+          FROM pages p WHERE p.slug = $1
+          UNION ALL
+          SELECT p2.id, w.depth + 1, w.visited || p2.id
+          FROM walk w
+          JOIN links l ON (l.from_page_id = w.id OR l.to_page_id = w.id)
+          JOIN pages p2 ON p2.id = CASE WHEN l.from_page_id = w.id THEN l.to_page_id ELSE l.from_page_id END
+          WHERE w.depth < $2
+            AND NOT (p2.id = ANY(w.visited))
+            ${linkTypeWhere}
+        )
+        SELECT pf.slug AS from_slug, pt.slug AS to_slug,
+               l.link_type, l.context, w.depth + 1 AS depth
+        FROM walk w
+        JOIN links l ON (l.from_page_id = w.id OR l.to_page_id = w.id)
+        JOIN pages pf ON pf.id = l.from_page_id
+        JOIN pages pt ON pt.id = l.to_page_id
+        WHERE w.depth < $2
+          ${linkTypeWhere}
+        ORDER BY depth, from_slug, to_slug
+      `;
+    }
+
+    const { rows } = await this.db.query(sql, params);
+    // Dedup edges (same from/to/type/depth can appear via multiple visited paths).
+    const seen = new Set<string>();
+    const result: GraphPath[] = [];
+    for (const r of rows as Record<string, unknown>[]) {
+      const key = `${r.from_slug}|${r.to_slug}|${r.link_type}|${r.depth}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push({
+        from_slug: r.from_slug as string,
+        to_slug: r.to_slug as string,
+        link_type: r.link_type as string,
+        context: (r.context as string) || '',
+        depth: r.depth as number,
+      });
+    }
+    return result;
+  }
+
+  async getBacklinkCounts(slugs: string[]): Promise<Map<string, number>> {
+    const result = new Map<string, number>();
+    if (slugs.length === 0) return result;
+    // Initialize all slugs to 0 so callers get a consistent map.
+    for (const s of slugs) result.set(s, 0);
+
+    // PGLite needs explicit cast for array binding (does not auto-serialize JS arrays).
+    const { rows } = await this.db.query(
+      `SELECT p.slug AS slug, COUNT(l.id)::int AS cnt
+       FROM pages p
+       LEFT JOIN links l ON l.to_page_id = p.id
+       WHERE p.slug = ANY($1::text[])
+       GROUP BY p.slug`,
+      [slugs]
+    );
+    for (const r of rows as { slug: string; cnt: number }[]) {
+      result.set(r.slug, Number(r.cnt));
+    }
+    return result;
+  }
+
+  async findOrphanPages(): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+    const { rows } = await this.db.query(
+      `SELECT
+         p.slug,
+         COALESCE(p.title, p.slug) AS title,
+         p.frontmatter->>'domain' AS domain
+       FROM pages p
+       WHERE NOT EXISTS (
+         SELECT 1 FROM links l WHERE l.to_page_id = p.id
+       )
+       ORDER BY p.slug`
+    );
+    return rows as Array<{ slug: string; title: string; domain: string | null }>;
   }
 
   // Tags
@@ -432,13 +714,47 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Timeline
-  async addTimelineEntry(slug: string, entry: TimelineInput): Promise<void> {
+  async addTimelineEntry(
+    slug: string,
+    entry: TimelineInput,
+    opts?: { skipExistenceCheck?: boolean },
+  ): Promise<void> {
+    if (!opts?.skipExistenceCheck) {
+      const { rows } = await this.db.query('SELECT 1 FROM pages WHERE slug = $1', [slug]);
+      if (rows.length === 0) {
+        throw new Error(`Page not found: ${slug}`);
+      }
+    }
+    // ON CONFLICT DO NOTHING via the (page_id, date, summary) unique index.
+    // If insert is a no-op (duplicate), no row is returned; that's intentional.
     await this.db.query(
       `INSERT INTO timeline_entries (page_id, date, source, summary, detail)
        SELECT id, $2::date, $3, $4, $5
-       FROM pages WHERE slug = $1`,
+       FROM pages WHERE slug = $1
+       ON CONFLICT (page_id, date, summary) DO NOTHING`,
       [slug, entry.date, entry.source || '', entry.summary, entry.detail || '']
     );
+  }
+
+  async addTimelineEntriesBatch(entries: TimelineBatchInput[]): Promise<number> {
+    if (entries.length === 0) return 0;
+    const slugs = entries.map(e => e.slug);
+    const dates = entries.map(e => e.date);
+    const sources = entries.map(e => e.source || '');
+    const summaries = entries.map(e => e.summary);
+    const details = entries.map(e => e.detail || '');
+    const sourceIds = entries.map(e => e.source_id || 'default');
+    const result = await this.db.query(
+      `INSERT INTO timeline_entries (page_id, date, source, summary, detail)
+       SELECT p.id, v.date::date, v.source, v.summary, v.detail
+       FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+         AS v(slug, date, source, summary, detail, source_id)
+       JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id
+       ON CONFLICT (page_id, date, summary) DO NOTHING
+       RETURNING 1`,
+      [slugs, dates, sources, summaries, details, sourceIds]
+    );
+    return result.rows.length;
   }
 
   async getTimeline(slug: string, opts?: TimelineOpts): Promise<TimelineEntry[]> {
@@ -575,7 +891,14 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async getHealth(): Promise<BrainHealth> {
+    // Combined metrics from master (brain_score components: dead_links, link_count,
+    // pages_with_timeline) and v0.10.3 graph layer (link_coverage, timeline_coverage,
+    // most_connected). Both coexist: master's brain_score is the composite
+    // dashboard, v0.10.3 metrics give entity-page-level granularity.
     const { rows: [h] } = await this.db.query(`
+      WITH entity_pages AS (
+        SELECT id, slug FROM pages WHERE type IN ('person', 'company')
+      )
       SELECT
         (SELECT count(*) FROM pages) as page_count,
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NOT NULL)::float /
@@ -583,6 +906,8 @@ export class PGLiteEngine implements BrainEngine {
         (SELECT count(*) FROM pages p
          WHERE p.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id)
         ) as stale_pages,
+        -- Bug 11 — orphan = islanded (no inbound AND no outbound).
+        -- See BrainHealth.orphan_pages docstring; docs updated to match this.
         (SELECT count(*) FROM pages p
          WHERE NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)
            AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id)
@@ -592,7 +917,23 @@ export class PGLiteEngine implements BrainEngine {
         ) as dead_links,
         (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
-        (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline
+        (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline,
+        (SELECT count(*) FROM entity_pages e
+         WHERE EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id))::float /
+          GREATEST((SELECT count(*) FROM entity_pages), 1)::float as link_coverage,
+        (SELECT count(*) FROM entity_pages e
+         WHERE EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = e.id))::float /
+          GREATEST((SELECT count(*) FROM entity_pages), 1)::float as timeline_coverage
+    `);
+
+    // Top 5 most connected entities by total link count (in + out).
+    const { rows: connected } = await this.db.query(`
+      SELECT p.slug,
+             (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
+      FROM pages p
+      WHERE p.type IN ('person', 'company')
+      ORDER BY link_count DESC
+      LIMIT 5
     `);
 
     const r = h as Record<string, unknown>;
@@ -604,22 +945,37 @@ export class PGLiteEngine implements BrainEngine {
     const pagesWithTimeline = Number(r.pages_with_timeline);
 
     const linkDensity = pageCount > 0 ? Math.min(linkCount / pageCount, 1) : 0;
-    const timelineCoverage = pageCount > 0 ? Math.min(pagesWithTimeline / pageCount, 1) : 0;
+    const timelineCoverageDensity = pageCount > 0 ? Math.min(pagesWithTimeline / pageCount, 1) : 0;
     const noOrphans = pageCount > 0 ? 1 - (orphanPages / pageCount) : 1;
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
-    const brainScore = pageCount === 0 ? 0 : Math.round(
-      (embedCoverage * 0.35 + linkDensity * 0.25 + timelineCoverage * 0.15 +
-       noOrphans * 0.15 + noDeadLinks * 0.10) * 100
-    );
+    // Bug 11 — per-component points. Sum equals brainScore by construction
+    // so `doctor` can render a breakdown that adds up to the total.
+    const embedCoverageScore = pageCount === 0 ? 0 : Math.round(embedCoverage * 35);
+    const linkDensityScore = pageCount === 0 ? 0 : Math.round(linkDensity * 25);
+    const timelineCoverageScore = pageCount === 0 ? 0 : Math.round(timelineCoverageDensity * 15);
+    const noOrphansScore = pageCount === 0 ? 0 : Math.round(noOrphans * 15);
+    const noDeadLinksScore = pageCount === 0 ? 0 : Math.round(noDeadLinks * 10);
+    const brainScore = embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore;
 
     return {
       page_count: pageCount,
       embed_coverage: embedCoverage,
       stale_pages: Number(r.stale_pages),
       orphan_pages: orphanPages,
-      dead_links: deadLinks,
       missing_embeddings: Number(r.missing_embeddings),
       brain_score: brainScore,
+      dead_links: deadLinks,
+      link_coverage: Number(r.link_coverage),
+      timeline_coverage: Number(r.timeline_coverage),
+      most_connected: (connected as { slug: string; link_count: number }[]).map(c => ({
+        slug: c.slug,
+        link_count: Number(c.link_count),
+      })),
+      embed_coverage_score: embedCoverageScore,
+      link_density_score: linkDensityScore,
+      timeline_coverage_score: timelineCoverageScore,
+      no_orphans_score: noOrphansScore,
+      no_dead_links_score: noDeadLinksScore,
     };
   }
 
@@ -682,5 +1038,10 @@ export class PGLiteEngine implements BrainEngine {
       [slug]
     );
     return (rows as Record<string, unknown>[]).map(r => rowToChunk(r, true));
+  }
+
+  async executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
+    const { rows } = await this.db.query(sql, params);
+    return rows as T[];
   }
 }

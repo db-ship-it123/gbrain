@@ -11,6 +11,7 @@
  */
 
 import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { randomBytes, createHash } from 'crypto';
@@ -198,7 +199,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // Admin API endpoints
   // ---------------------------------------------------------------------------
-  app.get('/admin/api/agents', requireAdmin, async (_req, res) => {
+  app.get('/admin/api/agents', requireAdmin, async (_req: Request, res: Response) => {
     try {
       const agents = await sql`
         SELECT client_id, client_name, grant_types, scope, created_at
@@ -210,7 +211,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
   });
 
-  app.get('/admin/api/stats', requireAdmin, async (_req, res) => {
+  app.get('/admin/api/stats', requireAdmin, async (_req: Request, res: Response) => {
     try {
       const [clients] = await sql`SELECT count(*)::int as count FROM oauth_clients`;
       const [tokens] = await sql`SELECT count(*)::int as count FROM oauth_tokens WHERE token_type = 'access' AND expires_at > ${Math.floor(Date.now() / 1000)}`;
@@ -225,7 +226,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
   });
 
-  app.get('/admin/api/health-indicators', requireAdmin, async (_req, res) => {
+  app.get('/admin/api/health-indicators', requireAdmin, async (_req: Request, res: Response) => {
     try {
       const now = Math.floor(Date.now() / 1000);
       const [expiring] = await sql`SELECT count(*)::int as count FROM oauth_tokens WHERE token_type = 'access' AND expires_at BETWEEN ${now} AND ${now + 86400}`;
@@ -241,7 +242,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
   });
 
-  app.get('/admin/api/requests', requireAdmin, async (req, res) => {
+  app.get('/admin/api/requests', requireAdmin, async (req: Request, res: Response) => {
     try {
       const page = parseInt(req.query.page as string) || 1;
       const limit = 50;
@@ -271,7 +272,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   });
 
   // Register client from admin dashboard
-  app.post('/admin/api/register-client', requireAdmin, express.json(), async (req, res) => {
+  app.post('/admin/api/register-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
     try {
       const { name, scopes } = req.body;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
@@ -287,7 +288,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // SSE live activity feed
   // ---------------------------------------------------------------------------
-  app.get('/admin/events', requireAdmin, (req, res) => {
+  app.get('/admin/events', requireAdmin, (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -307,7 +308,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   if (fs.existsSync(adminDistPath)) {
     app.use('/admin', express.static(adminDistPath));
     // SPA fallback: serve index.html for all unmatched /admin/* routes
-    app.get('/admin/*', (req, res, next) => {
+    app.get('/admin/*', (req: Request, res: Response, next: NextFunction) => {
       // Skip API and events routes
       if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
         return next();
@@ -321,7 +322,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   const mcpOperations = operations.filter(op => !op.localOnly);
 
-  app.post('/mcp', requireBearerAuth({ provider: oauthProvider }), async (req, res) => {
+  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider }), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 
